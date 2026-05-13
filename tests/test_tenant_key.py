@@ -12,6 +12,7 @@ the proxy handler tests; this file pins the pure resolver contract.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import logging
 from types import SimpleNamespace
 
@@ -24,6 +25,7 @@ from headroom.proxy.tenant_key import (
     SOURCE_HASH,
     SOURCE_HEADER,
     TENANT_KEY_HEADER_ENV_VAR,
+    TENANT_KEY_HMAC_KEY_ENV_VAR,
     get_current_tenant_key,
     resolve_tenant_key,
     set_request_tenant_key,
@@ -89,8 +91,11 @@ def test_header_path_falls_through_when_empty_after_sanitization() -> None:
 # ── Hash path ─────────────────────────────────────────────────────────
 
 
-def test_hash_path_when_no_header_but_auth_mode_and_bearer() -> None:
-    """No header, but auth_mode + bearer ⇒ deterministic SHA-256[:24]."""
+def test_hash_path_when_no_header_but_auth_mode_and_bearer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No header, but auth_mode + bearer ⇒ deterministic HMAC-SHA256[:24]."""
+    monkeypatch.setenv(TENANT_KEY_HMAC_KEY_ENV_VAR, "test-tenant-hmac-key")
     token = "sk-ant-api03-abc123def456ghi789"
     req = _request(
         headers={"authorization": f"Bearer {token}"},
@@ -98,7 +103,11 @@ def test_hash_path_when_no_header_but_auth_mode_and_bearer() -> None:
     )
     tenant_key, source = resolve_tenant_key(req)
     assert source == SOURCE_HASH
-    expected = hashlib.sha256(f"payg:{token}".encode()).hexdigest()[:24]
+    expected = hmac.new(
+        b"test-tenant-hmac-key",
+        f"payg:{token}".encode(),
+        hashlib.sha256,
+    ).hexdigest()[:24]
     assert tenant_key == expected
     assert len(tenant_key) == 24
 

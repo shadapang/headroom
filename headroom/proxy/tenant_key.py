@@ -30,8 +30,8 @@ The resolver picks the most-specific signal available, in this order:
 
 2. **Hash** — when no header is present but both an auth_mode (from
    F1) and a bearer token are. The key is
-   ``sha256("{auth_mode}:{api_key}")[:24]``. Source: ``"hash"``.
-   SHA-256[:24] is the same idiom PR #395 uses in
+   ``HMAC-SHA256("{auth_mode}:{api_key}")[:24]``. Source: ``"hash"``.
+   HMAC-SHA256[:24] is the same digest-width idiom PR #395 uses in
    ``headroom/cache/compression_store.py`` for content hashing — keeping
    it consistent so operators only need to learn one truncation rule.
    Hashing the full bearer token avoids collisions across real API keys
@@ -86,6 +86,7 @@ as the existing ``_request_ccr_store`` ContextVar in
 from __future__ import annotations
 
 import hashlib
+import hmac
 import logging
 import os
 import unicodedata
@@ -102,6 +103,7 @@ logger = logging.getLogger(__name__)
 # load-bearing for tenant isolation.
 TENANT_KEY_HEADER_ENV_VAR: Final[str] = "HEADROOM_TENANT_KEY_HEADER"
 DEFAULT_TENANT_KEY_HEADER: Final[str] = "X-Headroom-Tenant-ID"
+TENANT_KEY_HMAC_KEY_ENV_VAR: Final[str] = "HEADROOM_TENANT_KEY_HMAC_KEY"
 
 # ── Tenant-key constants ──────────────────────────────────────────────
 # Maximum length we'll accept after sanitization. 64 chars is enough
@@ -111,18 +113,16 @@ DEFAULT_TENANT_KEY_HEADER: Final[str] = "X-Headroom-Tenant-ID"
 # header by mistake.
 _MAX_TENANT_KEY_LEN: Final[int] = 64
 
-# Bearer-token prefix length used for the hash-mode key. 8 chars is
-# enough to disambiguate distinct API keys (Anthropic / OpenAI / Codex
-# all have ≥ 32 char keys with high-entropy first 8 chars after the
-# common prefix) without leaking the secret. Anyone who can read the
-# logs already sees the request, so 8 chars gives them no advantage.
+# Minimum bearer-token length used for the hash-mode key. Shorter
+# values are too low-entropy to be useful as a fallback tenant signal.
 _MIN_BEARER_TOKEN_LEN: Final[int] = 8
 
-# SHA-256[:24] truncation — same idiom as PR #395
+# HMAC-SHA256[:24] truncation — same digest-width idiom as PR #395
 # (``compression_store.py`` line 241). Keeping the truncation length
 # consistent across the codebase so operators don't have to track two
 # different "how much of a hash do we keep" rules.
 _HASH_TRUNCATION_LEN: Final[int] = 24
+_DEFAULT_TENANT_HMAC_KEY: Final[bytes] = b"headroom:tenant-key:v1"
 
 # Literal namespace name used when neither a tenant-id header nor a
 # bearer token is present. This is a real namespace, not a sentinel —
@@ -192,7 +192,7 @@ def resolve_tenant_key(request: Any) -> tuple[str, str]:
 
     1. ``HEADROOM_TENANT_KEY_HEADER`` (default ``X-Headroom-Tenant-ID``)
        header → ``"header"`` source.
-    2. SHA-256[:24] of ``f"{auth_mode}:{bearer_token}"`` → ``"hash"``.
+    2. HMAC-SHA256[:24] of ``f"{auth_mode}:{bearer_token}"`` → ``"hash"``.
     3. Literal ``"global"`` namespace → ``"global"`` source.
 
     Every resolution emits a ``tenant_key_resolved`` structured log so
@@ -233,7 +233,7 @@ def resolve_tenant_key(request: Any) -> tuple[str, str]:
     auth_mode_str = _get_auth_mode_str(request)
     bearer_token = _get_bearer_token(request)
     if auth_mode_str and bearer_token:
-        digest = hashlib.sha256(f"{auth_mode_str}:{bearer_token}".encode()).hexdigest()
+        digest = _tenant_key_hmac(f"{auth_mode_str}:{bearer_token}")
         tenant_key = digest[:_HASH_TRUNCATION_LEN]
         _emit_resolution_log(tenant_key, SOURCE_HASH, auth_mode=auth_mode_str)
         return tenant_key, SOURCE_HASH
@@ -320,6 +320,18 @@ def _get_bearer_token(request: Any) -> str:
         return ""
     return token
 
+def _tenant_key_hmac(message: str) -> str:
+    """Return a pseudonymous digest for hash-mode tenant identity.
+
+    The bearer token is sensitive, so never log or store it and avoid a
+    raw token digest. HMAC keeps deterministic per-key partitioning for
+    TOIN while making the fallback tenant key deployment-scoped when
+    ``HEADROOM_TENANT_KEY_HMAC_KEY`` is set.
+    """
+    raw_key = os.environ.get(TENANT_KEY_HMAC_KEY_ENV_VAR)
+    key = raw_key.encode() if raw_key else _DEFAULT_TENANT_HMAC_KEY
+    return hmac.new(key, message.encode(), hashlib.sha256).hexdigest()
+
 
 def _sanitize_tenant_key(raw: str) -> str:
     """Sanitize a tenant_key candidate. Returns ``""`` on rejection.
@@ -398,8 +410,8 @@ def _emit_resolution_log(
 
     The ``tenant_key`` value itself is included in the structured
     fields. It's not a secret: header-mode keys are operator-supplied
-    identifiers and hash-mode keys are SHA-256 truncations of an
-    ``(auth_mode, bearer_token)`` pair (irreversible).
+    identifiers and hash-mode keys are HMAC-SHA256 truncations of an
+    ``(auth_mode, bearer_token)`` pair (irreversible and pseudonymous).
     """
     extra: dict[str, Any] = {
         "event": "tenant_key_resolved",
@@ -423,6 +435,7 @@ __all__ = [
     "SOURCE_HASH",
     "SOURCE_HEADER",
     "TENANT_KEY_HEADER_ENV_VAR",
+    "TENANT_KEY_HMAC_KEY_ENV_VAR",
     "get_current_tenant_key",
     "resolve_tenant_key",
     "set_request_tenant_key",
