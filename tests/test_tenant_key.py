@@ -12,8 +12,6 @@ the proxy handler tests; this file pins the pure resolver contract.
 from __future__ import annotations
 
 import hashlib
-import hmac
-import logging
 from types import SimpleNamespace
 
 import pytest
@@ -25,7 +23,7 @@ from headroom.proxy.tenant_key import (
     SOURCE_HASH,
     SOURCE_HEADER,
     TENANT_KEY_HEADER_ENV_VAR,
-    TENANT_KEY_HMAC_KEY_ENV_VAR,
+    TENANT_KEY_DIGEST_KEY_ENV_VAR,
     get_current_tenant_key,
     resolve_tenant_key,
     set_request_tenant_key,
@@ -94,8 +92,8 @@ def test_header_path_falls_through_when_empty_after_sanitization() -> None:
 def test_hash_path_when_no_header_but_auth_mode_and_bearer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No header, but auth_mode + bearer ⇒ deterministic HMAC-SHA256[:24]."""
-    monkeypatch.setenv(TENANT_KEY_HMAC_KEY_ENV_VAR, "test-tenant-hmac-key")
+    """No header, but auth_mode + bearer ⇒ deterministic BLAKE2b[:24]."""
+    monkeypatch.setenv(TENANT_KEY_DIGEST_KEY_ENV_VAR, "test-tenant-digest-key")
     token = "sk-ant-api03-abc123def456ghi789"
     req = _request(
         headers={"authorization": f"Bearer {token}"},
@@ -103,10 +101,10 @@ def test_hash_path_when_no_header_but_auth_mode_and_bearer(
     )
     tenant_key, source = resolve_tenant_key(req)
     assert source == SOURCE_HASH
-    expected = hmac.new(
-        b"test-tenant-hmac-key",
+    expected = hashlib.blake2b(
         f"payg:{token}".encode(),
-        hashlib.sha256,
+        key=b"test-tenant-digest-key",
+        digest_size=16,
     ).hexdigest()[:24]
     assert tenant_key == expected
     assert len(tenant_key) == 24
@@ -181,37 +179,44 @@ def test_global_fallback_when_no_signals() -> None:
     assert source == SOURCE_GLOBAL
 
 
-def test_global_fallback_emits_structured_log(caplog: pytest.LogCaptureFixture) -> None:
+def _capture_tenant_resolution_logs(monkeypatch: pytest.MonkeyPatch) -> list[SimpleNamespace]:
+    records: list[SimpleNamespace] = []
+
+    def _info(_message: str, *, extra: dict[str, object] | None = None) -> None:
+        records.append(SimpleNamespace(**(extra or {})))
+
+    monkeypatch.setattr("headroom.proxy.tenant_key.logger.info", _info)
+    return records
+
+
+def test_global_fallback_emits_structured_log(monkeypatch: pytest.MonkeyPatch) -> None:
     """The ``"global"`` source MUST log (no silent fallback)."""
     req = _request()
-    with caplog.at_level(logging.INFO, logger="headroom.proxy.tenant_key"):
-        resolve_tenant_key(req)
+    matching = _capture_tenant_resolution_logs(monkeypatch)
+    resolve_tenant_key(req)
 
-    matching = [r for r in caplog.records if getattr(r, "event", None) == "tenant_key_resolved"]
     assert len(matching) == 1
     assert matching[0].source == "global"  # type: ignore[attr-defined]
     assert matching[0].tenant_key == "global"  # type: ignore[attr-defined]
 
 
-def test_header_source_emits_structured_log(caplog: pytest.LogCaptureFixture) -> None:
+def test_header_source_emits_structured_log(monkeypatch: pytest.MonkeyPatch) -> None:
     """Header path also emits the structured log."""
     req = _request(headers={"X-Headroom-Tenant-ID": "tenant1"})
-    with caplog.at_level(logging.INFO, logger="headroom.proxy.tenant_key"):
-        resolve_tenant_key(req)
-    matching = [r for r in caplog.records if getattr(r, "event", None) == "tenant_key_resolved"]
+    matching = _capture_tenant_resolution_logs(monkeypatch)
+    resolve_tenant_key(req)
     assert len(matching) == 1
     assert matching[0].source == "header"  # type: ignore[attr-defined]
 
 
-def test_hash_source_emits_structured_log(caplog: pytest.LogCaptureFixture) -> None:
+def test_hash_source_emits_structured_log(monkeypatch: pytest.MonkeyPatch) -> None:
     """Hash path also emits the structured log."""
     req = _request(
         headers={"authorization": "Bearer sk-ant-api03-abc123def"},
         auth_mode="payg",
     )
-    with caplog.at_level(logging.INFO, logger="headroom.proxy.tenant_key"):
-        resolve_tenant_key(req)
-    matching = [r for r in caplog.records if getattr(r, "event", None) == "tenant_key_resolved"]
+    matching = _capture_tenant_resolution_logs(monkeypatch)
+    resolve_tenant_key(req)
     assert len(matching) == 1
     assert matching[0].source == "hash"  # type: ignore[attr-defined]
 
