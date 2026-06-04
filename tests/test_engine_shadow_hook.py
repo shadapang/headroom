@@ -661,8 +661,8 @@ class TestEngineCompressionCacheIsolation:
 
         # Make the legacy session_id (which the seeded store now forwards to
         # the engine) vary per request, so two conversations map to two ids.
-        proxy.session_tracker_store.compute_session_id = (
-            lambda request, model, messages: request.headers.get("x-test-session", "default")
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+            request.headers.get("x-test-session", "default")
         )
         fake_tracker = _FakePrefixTracker(frozen_count=0)
         proxy.session_tracker_store.get_or_create = lambda sid, provider: fake_tracker
