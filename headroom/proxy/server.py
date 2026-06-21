@@ -1661,6 +1661,27 @@ def _register_memory_components(proxy: HeadroomProxy, tracker: MemoryTracker) ->
     # registered when the memory system is initialized with specific backends.
 
 
+def _request_is_loopback(request: Request) -> bool:
+    """Return True iff the caller is on loopback by *both* peer IP and Host header.
+
+    Mirrors the two-gate check in :func:`loopback_guard.require_loopback`
+    (loopback client IP + loopback ``Host`` header, the DNS-rebinding defence)
+    but returns a bool instead of raising. Endpoints use it to vary their
+    payload — serving sensitive sub-blocks (upstream URLs, per-request logs)
+    only to loopback callers — rather than 404ing network callers that still
+    have a legitimate use for the non-sensitive aggregate fields.
+    """
+    from headroom.proxy.loopback_guard import is_loopback_host, is_loopback_host_header
+
+    client = getattr(request, "client", None)
+    client_host = getattr(client, "host", None) if client is not None else None
+    try:
+        host_header = request.headers.get("host")
+    except AttributeError:
+        host_header = None
+    return is_loopback_host(client_host) and is_loopback_host_header(host_header)
+
+
 def create_app(config: ProxyConfig | None = None) -> FastAPI:
     """Create FastAPI application."""
     if not FASTAPI_AVAILABLE:
@@ -2301,9 +2322,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         return JSONResponse(status_code=200 if payload["ready"] else 503, content=payload)
 
     @app.get("/health")
-    async def health():
+    async def health(request: Request):
         await _check_upstream()
-        payload = _health_payload(include_config=True)
+        # /health echoes upstream API URLs + backend config (the `config`
+        # block). That is operational detail an external scanner should not
+        # see, so include it only for loopback callers; network callers get the
+        # same body as /readyz (status + checks, no config). /livez and /readyz
+        # remain the unauthenticated probes for orchestration health.
+        payload = _health_payload(include_config=_request_is_loopback(request))
         return JSONResponse(status_code=200, content=payload)
 
     # Loopback-only debug introspection (Unit 5). A remote IP gets 404 —
@@ -2972,7 +2998,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             return payload
 
     @app.get("/stats")
-    async def stats(cached: bool = False):
+    async def stats(request: Request, cached: bool = False):
         """Get comprehensive proxy statistics.
 
         This is the main stats endpoint - it aggregates data from all subsystems:
@@ -2986,14 +3012,27 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         Use ``?cached=1`` for the dashboard fast path. That returns a short-TTL
         snapshot to avoid rebuilding the full payload on every UI poll.
+
+        ``recent_requests`` / ``request_logs`` (per-request ids, providers,
+        models, errors) and ``config`` (backend + savings profile) are embedded
+        only for loopback callers — the local dashboard. Network callers still
+        get the aggregate counters but never the per-request metadata.
         """
+        include_sensitive = _request_is_loopback(request)
         if cached:
             payload = dict(await _get_cached_stats_payload())
-            payload.update(_build_recent_request_payload())
-            payload["config"] = _dashboard_config_payload()
-            return payload
-        payload = await _build_stats_payload()
-        payload["config"] = _dashboard_config_payload()
+            if include_sensitive:
+                # Refresh the per-request tail on top of the cached snapshot.
+                payload.update(_build_recent_request_payload())
+                payload["config"] = _dashboard_config_payload()
+        else:
+            payload = await _build_stats_payload()
+            if include_sensitive:
+                payload["config"] = _dashboard_config_payload()
+        if not include_sensitive:
+            # _build_stats_payload bakes these in; strip for network callers.
+            payload.pop("recent_requests", None)
+            payload.pop("request_logs", None)
         return payload
 
     @app.post("/stats/reset", dependencies=[Depends(_require_loopback)])

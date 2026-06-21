@@ -66,3 +66,43 @@ def test_dns_rebinding_host_header_rejected() -> None:
     client = TestClient(_make_app(), base_url="http://127.0.0.1", client=("127.0.0.1", 12345))
     resp = client.get("/transformations/feed", headers={"host": "attacker.example"})
     assert resp.status_code == 404, resp.text
+
+
+def _client(*, loopback: bool) -> TestClient:
+    app = _make_app()
+    if loopback:
+        return TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345))
+    # Default TestClient presents client.host="testclient" — not loopback.
+    return TestClient(app)
+
+
+def test_health_config_block_is_loopback_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """/health stays reachable for monitors but hides the `config` block (which
+    echoes upstream API URLs + backend settings) from non-loopback callers."""
+    monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
+
+    network = _client(loopback=False).get("/health")
+    assert network.status_code == 200
+    assert "config" not in network.json()
+    # Basic health is still visible to monitors.
+    assert network.json()["status"] in {"healthy", "unhealthy"}
+
+    local = _client(loopback=True).get("/health")
+    assert local.status_code == 200
+    assert "config" in local.json()
+
+
+def test_stats_per_request_metadata_is_loopback_only() -> None:
+    """/stats keeps aggregate counters public but restricts per-request metadata
+    (recent_requests / request_logs) and `config` to loopback callers."""
+    network = _client(loopback=False).get("/stats")
+    assert network.status_code == 200
+    payload = network.json()
+    assert "tokens" in payload  # aggregate counters still served
+    assert "recent_requests" not in payload
+    assert "request_logs" not in payload
+    assert "config" not in payload
+
+    local = _client(loopback=True).get("/stats").json()
+    assert "recent_requests" in local
+    assert "config" in local
