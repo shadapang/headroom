@@ -7,13 +7,14 @@ operator explicitly opts in to full content.
 
 from __future__ import annotations
 
+import inspect
 from types import SimpleNamespace
 
 import pytest
 
 pytest.importorskip("fastapi")
 
-from headroom.proxy.handlers.anthropic import _debug_dump_mode, _redact_debug_value
+from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
 
 
 def _config(stateless: bool = False) -> SimpleNamespace:
@@ -75,3 +76,22 @@ def test_redact_passes_through_non_strings():
     assert _redact_debug_value(42) == 42
     assert _redact_debug_value(None) is None
     assert _redact_debug_value(True) is True
+
+
+@pytest.mark.parametrize("module_name", ["anthropic", "openai"])
+def test_both_handlers_gate_the_dump(module_name):
+    """Regression guard: every handler that writes a debug dump must gate it on
+    _debug_dump_mode (off by default). Prevents reintroducing an unguarded dump
+    that writes cleartext prompts to disk."""
+    import importlib
+
+    module = importlib.import_module(f"headroom.proxy.handlers.{module_name}")
+    src = inspect.getsource(module)
+    if "debug_400_dir(" in src:
+        assert '_debug_dump_mode(self.config)' in src, (
+            f"{module_name} writes a debug dump but does not gate it on "
+            f"_debug_dump_mode"
+        )
+        assert 'if dump_mode != "off":' in src, (
+            f"{module_name} debug dump is not guarded by an off-by-default check"
+        )

@@ -29,44 +29,13 @@ from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy.auth_mode import classify_auth_mode, classify_client
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.forwarded_headers import resolve_client_ip
+from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
 from headroom.proxy.helpers import extract_tags
 from headroom.proxy.memory_decision import MemoryDecision
 from headroom.proxy.memory_query import MemoryQuery
 from headroom.proxy.outcome import RequestOutcome
 
 logger = logging.getLogger("headroom.proxy")
-
-
-def _debug_dump_mode(config: Any) -> str:
-    """Return the diagnostic-dump mode for upstream (>=400) errors.
-
-    The dump can contain cleartext prompt/tool/system content, so it is OFF by
-    default and is never written in stateless mode. Opt in explicitly:
-    - "off"      : nothing written (default, and forced in stateless mode)
-    - "redacted" : structure, roles, and lengths only — content elided
-                   (``HEADROOM_DEBUG_DUMP=1``/``true``/``on``/``redacted``)
-    - "full"     : everything including content (``HEADROOM_DEBUG_DUMP=full``)
-    """
-    if getattr(config, "stateless", False):
-        return "off"
-    raw = os.environ.get("HEADROOM_DEBUG_DUMP", "").strip().lower()
-    if raw in ("full", "all", "content"):
-        return "full"
-    if raw in ("1", "true", "yes", "on", "redacted"):
-        return "redacted"
-    return "off"
-
-
-def _redact_debug_value(value: Any, _max_len: int = 80) -> Any:
-    """Recursively elide long strings (likely prompt/tool content) while keeping
-    structure, roles, type tags, ids, and other short fields for debugging."""
-    if isinstance(value, str):
-        return value if len(value) <= _max_len else f"<redacted: {len(value)} chars>"
-    if isinstance(value, dict):
-        return {k: _redact_debug_value(v, _max_len) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_redact_debug_value(v, _max_len) for v in value]
-    return value
 
 
 class AnthropicHandlerMixin:
