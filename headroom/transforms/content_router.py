@@ -889,15 +889,19 @@ class ContentRouterConfig:
     # Set to None to use DEFAULT_EXCLUDE_TOOLS, or provide custom set
     exclude_tools: set[str] | None = None
 
-    # For EXCLUDED tools, still apply byte-lossless search-fold to grep-shaped
-    # output (path:line:content -> ripgrep --heading form). Excluded tools are
-    # protected from *lossy* compression for accuracy (e.g. Read output feeds
-    # Edit's exact old_string match); this only reformats grep/search output
-    # into a smaller, byte-recoverable shape (search_unheading reproduces the
-    # original exactly), so there is zero information loss. No-op on any content
-    # that isn't grep-shaped (Read/code/logs pass through untouched). Off by
-    # default. Closes the OpenCode native-Grep gap that RTK (shell-only) misses.
-    compact_excluded_search: bool = False
+    # For EXCLUDED tools, still apply information-preserving compaction by
+    # detected shape (excluded tools are protected only from *lossy*
+    # compression, for accuracy):
+    #   * SEARCH (grep path:line:content) -> ripgrep --heading fold. Byte-exact.
+    #   * LOG (build/test/app logs)       -> ANSI strip + run-collapse. Byte-
+    #                                        exact modulo non-semantic ANSI.
+    #   * JSON                            -> whitespace-minify. DATA-lossless
+    #                                        (same object) but NOT byte-exact —
+    #                                        a read-then-Edit(old_string) on the
+    #                                        same JSON file could miss.
+    # No-op on source code / glob path-lists. Off by default. Closes the
+    # OpenCode native-Grep/Read gap that RTK (shell-only, lossy) misses.
+    compact_excluded_lossless: bool = False
 
     # Read lifecycle management (stale/superseded detection)
     read_lifecycle: ReadLifecycleConfig = field(default_factory=ReadLifecycleConfig)
@@ -3090,12 +3094,13 @@ class ContentRouter(Transform):
                 tool_call_id = message.get("tool_call_id", "")
                 if tool_call_id in excluded_tool_ids:
                     if messages_from_end <= read_protection_window:
-                        # Protected from lossy compression — but grep-shaped
-                        # output can still be byte-losslessly search-folded.
-                        folded = self._lossless_fold_excluded(content)
-                        if folded is not None:
+                        # Protected from lossy compression — but grep/log/json
+                        # output can still be losslessly compacted.
+                        compacted = self._lossless_compact_excluded(content)
+                        if compacted is not None:
+                            folded, kind = compacted
                             result_slots[i] = {**message, "content": folded}
-                            transforms_applied.append("router:excluded:lossless_search")
+                            transforms_applied.append(f"router:excluded:lossless_{kind}")
                             route_counts["excluded_tool_lossless"] = (
                                 route_counts.get("excluded_tool_lossless", 0) + 1
                             )
@@ -3426,38 +3431,60 @@ class ContentRouter(Transform):
             timing=compressor_timing,
         )
 
-    def _lossless_fold_excluded(self, content: Any) -> str | None:
-        """Byte-lossless search-fold for a protected (excluded) tool output.
+    def _lossless_compact_excluded(self, content: Any) -> tuple[str, str] | None:
+        """Information-preserving compaction for a protected (excluded) tool output.
 
         Excluded tools are kept out of *lossy* compression for accuracy. This
-        applies only the reversible search-heading fold, and only when the
-        content is grep-shaped (``ContentType.SEARCH_RESULTS``): it reformats
-        ``path:line:content`` rows into ripgrep ``--heading`` form, which
-        ``compact_lossless`` self-checks as byte-recoverable (``search_unheading``
-        reproduces the original exactly). Returns the folded text when it is
-        grep-shaped and actually smaller, else ``None`` (keep verbatim). Read /
-        source / logs are not SEARCH_RESULTS, so they pass through untouched —
-        zero information loss, no marker. Never raises.
+        applies only reversible/data-preserving transforms, dispatched by
+        recognized shape:
+
+        * SEARCH (grep ``path:line:content``) -> ripgrep --heading fold.
+          Byte-recoverable (``search_unheading`` reproduces the original). Gated
+          on the dedicated ``_try_detect_search`` — the general classifier calls
+          grep-over-code SOURCE_CODE and would wrongly reject it.
+        * LOG (build/test/app logs) -> ANSI strip + run-collapse. Recoverable
+          modulo non-semantic ANSI color (``expand_runs`` restores the lines).
+        * JSON -> whitespace-minify. **Data-lossless** (``json.loads`` equals the
+          original object) but NOT byte-exact.
+
+        Returns ``(compacted, kind)`` when a recognized shape actually shrinks,
+        else ``None``. Source code and glob path-lists match nothing -> verbatim.
+        Never raises.
         """
-        if not self.config.compact_excluded_search:
+        if not self.config.compact_excluded_lossless:
             return None
         if not isinstance(content, str) or len(content) < 200:
             return None
         try:
-            # Use the dedicated search detector, not the general classifier:
-            # grep run over a codebase is classified SOURCE_CODE by the latter
-            # (the matched lines *are* code), so it would wrongly reject the very
-            # case this targets. _try_detect_search keys on the path:line:content
-            # row shape instead.
-            det = _try_detect_search(content)
-            if det is None or det.content_type is not ContentType.SEARCH_RESULTS:
-                return None
             from .lossless_compaction import compact_lossless
 
-            folded = compact_lossless(content, "search")
-            return folded if len(folded) < len(content) else None
+            det = _try_detect_search(content)
+            if det is not None and det.content_type is ContentType.SEARCH_RESULTS:
+                out = compact_lossless(content, "search")
+                return (out, "search") if len(out) < len(content) else None
+            if _try_detect_log(content) is not None:
+                out = compact_lossless(content, "log")
+                return (out, "log") if len(out) < len(content) else None
+            minified = self._minify_json_data_lossless(content)
+            return (minified, "json") if minified is not None else None
         except Exception:  # noqa: BLE001
             return None
+
+    @staticmethod
+    def _minify_json_data_lossless(content: str) -> str | None:
+        """Whitespace-minify a complete JSON value: data-preserving, not byte-exact.
+
+        The ``json.loads`` parse is the data-equality guarantee (identical
+        object). Returns the minified form only when the content is a JSON
+        object/array and the result is smaller; ``None`` otherwise (source code,
+        partial/non-JSON).
+        """
+        stripped = content.strip()
+        if not stripped or stripped[0] not in "{[":
+            return None
+        obj = json.loads(stripped)
+        minified = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+        return minified if len(minified) < len(content) else None
 
     def _get_tool_bias(self, tool_name: str) -> float:
         """Look up compression bias for a tool name.
@@ -3581,12 +3608,13 @@ class ContentRouter(Transform):
                 tool_use_id = block.get("tool_use_id", "")
                 if tool_use_id in excluded_tool_ids:
                     if messages_from_end <= read_protection_window:
-                        # Protected from lossy compression — but grep-shaped
-                        # output can still be byte-losslessly search-folded.
-                        folded = self._lossless_fold_excluded(block.get("content"))
-                        if folded is not None:
+                        # Protected from lossy compression — but grep/log/json
+                        # output can still be losslessly compacted.
+                        compacted = self._lossless_compact_excluded(block.get("content"))
+                        if compacted is not None:
+                            folded, kind = compacted
                             new_blocks.append({**block, "content": folded})
-                            transforms_applied.append("router:excluded:lossless_search")
+                            transforms_applied.append(f"router:excluded:lossless_{kind}")
                             if route_counts is not None:
                                 route_counts["excluded_tool_lossless"] = (
                                     route_counts.get("excluded_tool_lossless", 0) + 1
