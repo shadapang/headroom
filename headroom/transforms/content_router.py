@@ -52,6 +52,7 @@ from typing import Any
 from ..config import (
     DEFAULT_EXCLUDE_TOOLS,
     ReadLifecycleConfig,
+    RelevanceScorerConfig,
     TransformResult,
     is_tool_excluded,
 )
@@ -61,6 +62,7 @@ from .base import Transform
 from .content_detector import ContentType, DetectionResult, _try_detect_log, _try_detect_search
 from .content_detector import detect_content_type as _regex_detect_content_type
 from .error_detection import content_has_strong_error_indicators
+from .relevance_split import build_relevance_query, plan_relevance_split
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +74,23 @@ _detect_native_unhealthy = False  # circuit breaker: native detect hung once (#5
 
 def _router_debug_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
+
+
+def _tool_call_args_text(raw: Any) -> str:
+    """Compact, query-usable text from a tool call's args.
+
+    Anthropic passes ``input`` as a dict ({"command": "grep …"}); OpenAI passes
+    ``arguments`` as a JSON string. Either way we want the scalar values (the
+    grep pattern, the read path) as a short query fragment. Capped so a giant
+    arg blob can't dominate the relevance query.
+    """
+    if isinstance(raw, str):
+        text = raw
+    elif isinstance(raw, dict):
+        text = " ".join(str(v) for v in raw.values() if isinstance(v, (str, int, float, bool)))
+    else:
+        return ""
+    return " ".join(text.split())[:300]
 
 
 def _log_router_debug(event: str, **payload: Any) -> None:
@@ -834,6 +853,17 @@ class ContentRouterConfig:
     # can run marker-free without constructing the crusher by hand.
     smart_crusher_lossless_only: bool | None = None
 
+    # Prompt-conditioned relevance split for the KEEP/DROP tail. When enabled,
+    # LOG/SEARCH output is segmented into records, each scored against the
+    # request's information need (user prompt + triggering tool-call args) via
+    # `relevance` below; high-relevance records are kept verbatim and the
+    # low-relevance tail is Kompressed. Works in both modes: in lossless mode
+    # the tail is marker-free; in CCR mode it carries a retrieval marker (via
+    # ccr_inject_marker) so dropped detail stays retrievable. Off by default:
+    # a new hot-path ML step, gated like Kompress/CacheAligner.
+    relevance_split: bool = False
+    relevance: RelevanceScorerConfig = field(default_factory=RelevanceScorerConfig)
+
     # Tag protection: preserve custom/workflow XML tags from text compression.
     # When False (default), entire <custom-tag>content</custom-tag> blocks are
     # protected verbatim.  When True, only the tag markers are protected and
@@ -1140,6 +1170,12 @@ class ContentRouter(Transform):
         self._html_extractor: Any = None
         self._tabular_compressor: Any = None
         self._kompress: Any = None
+        # Stage B relevance split (lazy; None until first use, sentinel-checked
+        # via _relevance_scorer_tried so a failed load isn't retried per call).
+        self._relevance_scorer: Any = None
+        self._relevance_scorer_tried: bool = False
+        # tool_call_id → compact args text, populated by _build_tool_name_map.
+        self._tool_call_args: dict[str, str] = {}
 
         # Phase 0 (#1171): cap the input size handed to kompress (ModernBERT
         # ONNX). Its inference scales O(tokens) and runs synchronously on the
@@ -1630,6 +1666,24 @@ class ContentRouter(Transform):
         strategy_chain: list[str] = [strategy.value]
         error: str | None = None
 
+        # Stage B/C: prompt-conditioned relevance split for LOG/SEARCH — keep
+        # relevant records verbatim, compress the low-value tail. Runs in BOTH
+        # modes; the tail's marker behavior follows the mode automatically via
+        # _try_ml_compressor: lossless → marker-free Kompress; CCR → Kompress
+        # with a retrieval marker so the dropped detail stays retrievable (a
+        # safety net if the scorer is wrong). DIFF is excluded — Kompressing
+        # hunks breaks `git apply`. Returns None (falls through to the normal
+        # path) when disabled, unavailable, or no better than plain compression.
+        if self.config.relevance_split and strategy in (
+            CompressionStrategy.LOG,
+            CompressionStrategy.SEARCH,
+        ):
+            kind = "log" if strategy is CompressionStrategy.LOG else "search"
+            split = self._relevance_split_compress(content, kind, context)
+            if split is not None:
+                label = f"lossless_{kind}" if self.config.lossless else kind
+                return split, len(split.split()), [label, "relevance_split"]
+
         # No-CCR lossless mode: LOG/SEARCH/DIFF get format-native lossless
         # compaction instead of the lossy Rust drop path, so the output stays
         # marker-free (no `<<ccr:…>>` / `Retrieve …`) and fully recoverable.
@@ -2117,6 +2171,77 @@ class ContentRouter(Transform):
                 logger.debug("LogCompressor not available")
         return self._log_compressor
 
+    def _get_relevance_scorer(self) -> Any:
+        """Get the relevance scorer for the Stage B split (lazy, cached).
+
+        Tier comes from ``config.relevance``; hybrid/embedding degrade to BM25
+        when fastembed isn't installed. Returns None (once, cached) on any
+        failure so callers fall back to the plain lossless path. Never raises.
+        """
+        if self._relevance_scorer is not None or self._relevance_scorer_tried:
+            return self._relevance_scorer
+        self._relevance_scorer_tried = True
+        try:
+            from ..relevance import create_scorer
+
+            self._relevance_scorer = create_scorer(self.config.relevance.tier)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("relevance scorer unavailable: %s", exc)
+            self._relevance_scorer = None
+        return self._relevance_scorer
+
+    def _relevance_split_compress(self, content: str, kind: str, query: str) -> str | None:
+        """Prompt-conditioned KEEP/DROP split for the compression tail.
+
+        Keeps high-relevance records byte-verbatim (lossless-compacted) and
+        Kompresses the low-relevance tail (identifiers pinned by Kompress
+        MUST_KEEP). Mode-agnostic: the tail's marker behavior is decided by
+        ``_try_ml_compressor`` — marker-free in lossless mode, retrieval-marker
+        in CCR mode. Returns the spliced output, or None to fall back to the
+        normal path when the scorer is unavailable, the query is empty, nothing
+        is dropped, or the split doesn't beat plain compaction. Never raises.
+
+        ponytail: embeds one vector per record — O(records) on the request
+        thread. Contained today by opt-in gating; add a record cap / background
+        pre-warm if this goes default-on.
+        """
+        scorer = self._get_relevance_scorer()
+        if scorer is None or not query.strip():
+            return None
+        from .lossless_compaction import compact_lossless
+
+        try:
+            runs = plan_relevance_split(
+                content,
+                query,
+                scorer,
+                threshold=self.config.relevance.relevance_threshold,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("relevance split failed (%s); falling back", exc)
+            return None
+
+        # No low-relevance tail → plain compaction is already optimal here.
+        if not any(not keep for keep, _ in runs):
+            return None
+
+        out_parts: list[str] = []
+        for keep, text in runs:
+            if keep:
+                out_parts.append(compact_lossless(text, kind))
+                continue
+            try:
+                compressed, _ = self._try_ml_compressor(text, query)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("kompress tail failed (%s); keeping verbatim", exc)
+                compressed = compact_lossless(text, kind)
+            out_parts.append(compressed)
+
+        result = "".join(out_parts)
+        # Adopt only when it beats plain whole-block lossless compaction.
+        baseline = compact_lossless(content, kind)
+        return result if len(result) < len(baseline) else None
+
     def _get_text_crusher(self) -> Any:
         """Get TextCrusher (Phase 2, lazy load). Returns None when disabled, or
         when the native ``headroom._core`` extension is not built (mirrors the
@@ -2426,9 +2551,15 @@ class ContentRouter(Transform):
         """Build mapping from tool_call_id to tool_name.
 
         Scans assistant messages to find tool calls and extract their names.
-        Supports both OpenAI and Anthropic message formats.
+        Supports both OpenAI and Anthropic message formats. Also populates
+        ``self._tool_call_args`` (id → compact args text) in the same scan, so
+        the relevance split can score a tool output against the *precise* ask
+        that triggered it (grep pattern, read path, …), not just the user
+        prompt. Read-only after build → safe to read from the parallel
+        compression pass.
         """
         mapping: dict[str, str] = {}
+        args_map: dict[str, str] = {}
 
         for msg in messages:
             if msg.get("role") != "assistant":
@@ -2438,9 +2569,13 @@ class ContentRouter(Transform):
             for tc in msg.get("tool_calls", []):
                 if isinstance(tc, dict):
                     tc_id = tc.get("id", "")
-                    name = tc.get("function", {}).get("name", "")
+                    fn = tc.get("function", {})
+                    name = fn.get("name", "")
                     if tc_id and name:
                         mapping[tc_id] = name
+                        args = _tool_call_args_text(fn.get("arguments"))
+                        if args:
+                            args_map[tc_id] = args
 
             # Anthropic format: content blocks with type=tool_use
             content = msg.get("content", [])
@@ -2451,7 +2586,11 @@ class ContentRouter(Transform):
                         name = block.get("name", "")
                         if tc_id and name:
                             mapping[tc_id] = name
+                            args = _tool_call_args_text(block.get("input"))
+                            if args:
+                                args_map[tc_id] = args
 
+        self._tool_call_args = args_map
         return mapping
 
     def _net_cost_allows(
@@ -3350,6 +3489,15 @@ class ContentRouter(Transform):
                 tool_name = (tool_name_map or {}).get(tool_use_id, "")
                 bias = self._get_tool_bias(tool_name) if tool_name else 1.0
 
+                # Enrich the relevance query with the triggering tool call's
+                # args (grep pattern, read path, …) — the sharpest, per-output
+                # signal. Gated so default behavior is byte-identical.
+                block_context = context
+                if self.config.relevance_split and tool_use_id:
+                    call_args = self._tool_call_args.get(tool_use_id, "")
+                    if call_args:
+                        block_context = build_relevance_query(context, tool_name, call_args)
+
                 tool_content = block.get("content", "")
 
                 # Protection: failed tool calls / error outputs stay verbatim
@@ -3394,7 +3542,7 @@ class ContentRouter(Transform):
                         content_key=hash(
                             (tool_content, getattr(self, "_runtime_target_ratio", None))
                         ),
-                        context=context,
+                        context=block_context,
                         bias=bias,
                         min_ratio=min_ratio,
                         compressor_timing=compressor_timing,
