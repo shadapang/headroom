@@ -1747,6 +1747,48 @@ class ContentRouter(Transform):
             ],
         )
 
+    def _lossless_first(
+        self, content: str, strategy: CompressionStrategy
+    ) -> tuple[str, str | None]:
+        """Byte/data-lossless first pass (intended design: always runs, pre-lossy).
+
+        Maps the (content-detected) strategy to its format-native lossless fold —
+        SEARCH -> ripgrep --heading form, LOG -> run-collapse + ANSI strip, DIFF
+        -> drop ``index`` bookkeeping — and gives every other content type a
+        trivial blank-run collapse. ``compact_lossless`` is self-verifying (exact
+        inverse or unchanged) and returns the input when it cannot safely shrink,
+        so this never loses information and is a strict no-op when nothing folds.
+
+        Returns ``(folded, "lossless_<kind>")`` when a real byte shrink happened,
+        else ``(content, None)``.
+        """
+        from headroom.transforms.lossless_compaction import compact_lossless
+
+        # Apply losslessness to the OUTPUT structure, not to the classification:
+        # try the fold implied by the detected strategy first, then the others.
+        # Each compact_lossless call is self-verifying (exact inverse or returns
+        # the input unchanged), so attempting a fold on non-matching content is a
+        # safe no-op — this recovers folds on content the detector misroutes
+        # (e.g. `grep -n` of .py files classified as SOURCE_CODE still gets the
+        # search fold). Keep the single fold that shrinks the most.
+        primary = {
+            CompressionStrategy.SEARCH: "search",
+            CompressionStrategy.LOG: "log",
+            CompressionStrategy.DIFF: "diff",
+        }.get(strategy)
+        order = ([primary] if primary else []) + [
+            k for k in ("search", "log", "diff", "text") if k != primary
+        ]
+        best, best_label = content, None
+        for kind in order:
+            try:
+                cand = compact_lossless(content, kind)
+            except Exception:
+                continue
+            if len(cand) < len(best):
+                best, best_label = cand, f"lossless_{kind}"
+        return best, best_label
+
     def _apply_strategy_to_content(
         self,
         content: str,
@@ -1786,6 +1828,30 @@ class ContentRouter(Transform):
         strategy_chain: list[str] = [strategy.value]
         error: str | None = None
 
+        # ── STAGE 0: LOSSLESS-FIRST (intended design) ────────────────────────
+        # Always attempt a byte/data-lossless fold BEFORE any lossy compressor,
+        # regardless of config.lossless — a lossless fold has zero accuracy cost,
+        # so it must never be gated off. Detection is content-based (the strategy
+        # is assigned by content_detector on the OUTPUT), so `cd DIR && rg …`,
+        # pipes and unknown tools route here by structure, not by command.
+        _ll_content, _ll_label = self._lossless_first(content, strategy)
+        if _ll_label is not None:
+            # A byte/data-lossless fold exists. It is fully recoverable and
+            # MARKER-FREE (zero-turn), so it is the answer for this block in BOTH
+            # modes: lossless-only obviously stops here, and in CCR mode we still
+            # prefer the marker-free fold over a lossy drop for the foldable
+            # formats (search/log/diff). Returning it directly also guarantees
+            # the fold is never discarded by a lossy stage that fails the gate.
+            return _ll_content, len(_ll_content.split()), [_ll_label]
+        if self.config.lossless:
+            # Lossless-only mode (HEADROOM_LOSSLESS=1, no CCR) and nothing
+            # folded → leave the content verbatim. Never emit a lossy /
+            # marker-free drop that could not be recovered without a retrieve.
+            return content, original_tokens, [CompressionStrategy.PASSTHROUGH.value]
+        # CCR mode (flag off), nothing foldable (code/json/text/mixed) → fall
+        # through to the lossy compressors below (kompress / smart_crusher /
+        # code), which attach CCR retrieval markers so any drop stays retrievable.
+
         # Stage B/C: prompt-conditioned relevance split for LOG/SEARCH — keep
         # relevant records verbatim, compress the low-value tail. Runs in BOTH
         # modes; the tail's marker behavior follows the mode automatically via
@@ -1804,30 +1870,11 @@ class ContentRouter(Transform):
                 label = f"lossless_{kind}" if self.config.lossless else kind
                 return split, len(split.split()), [label, "relevance_split"]
 
-        # No-CCR lossless mode: LOG/SEARCH/DIFF get format-native lossless
-        # compaction instead of the lossy Rust drop path, so the output stays
-        # marker-free (no `<<ccr:…>>` / `Retrieve …`) and fully recoverable.
-        # SMART_CRUSHER relies on smart_crusher_lossless_only (wired elsewhere);
-        # KOMPRESS/TEXT/CODE_AWARE/PASSTHROUGH pass through unchanged here in
-        # Stage A. The reversibility + size gate lives in compact_lossless,
-        # which returns the original when it can't safely shrink it.
-        if self.config.lossless and strategy in (
-            CompressionStrategy.LOG,
-            CompressionStrategy.SEARCH,
-            CompressionStrategy.DIFF,
-        ):
-            from headroom.transforms.lossless_compaction import compact_lossless
-
-            kind = {
-                CompressionStrategy.LOG: "log",
-                CompressionStrategy.SEARCH: "search",
-                CompressionStrategy.DIFF: "diff",
-            }[strategy]
-            try:
-                compacted = compact_lossless(content, kind)
-            except Exception:
-                compacted = content
-            return compacted, len(compacted.split()), [f"lossless_{kind}"]
+        # NOTE: the former "No-CCR lossless mode" LOG/SEARCH/DIFF dispatch that
+        # lived here is now handled up front by STAGE 0 (_lossless_first), which
+        # runs unconditionally and returns early in lossless-only mode. Lossy
+        # compressors below therefore always operate on the lossless-folded
+        # content in CCR mode.
 
         try:
             if strategy == CompressionStrategy.CODE_AWARE:
@@ -4006,6 +4053,31 @@ class ContentRouter(Transform):
         if compressor_timing is not None:
             key = f"compressor:{result.strategy_used.value}"
             compressor_timing[key] = compressor_timing.get(key, 0.0) + compress_ms
+        # Lossless-fold acceptance (byte-measured): a byte/data-lossless fold
+        # (search --heading, log run-collapse) has ZERO accuracy cost, so it must
+        # never be rejected by the WORD-ratio gate below — heading/indent folds
+        # cut tokens while word count stays flat or even rises. Accept on a real
+        # BYTE reduction (there is no tokenizer in scope here; byte length is a
+        # faithful token proxy for these folds) and store a byte-based ratio so
+        # the Tier-2 result cache reuses it on later turns. Only lossless-labeled
+        # (recoverable) folds take this path, so the lossy-unmarked reversibility
+        # guard below is intentionally not reached for them.
+        _chain = getattr(result, "strategy_chain", None) or []
+        _is_pure_lossless = bool(_chain) and all(
+            s.startswith("lossless_") for s in _chain
+        )
+        _ll_label = _chain[0] if _is_pure_lossless else None
+        if _ll_label is not None and len(result.compressed) < len(content):
+            _ll_ratio = len(result.compressed) / max(1, len(content))
+            self._cache.put(content_key, result.compressed, _ll_ratio, _ll_label)
+            transforms_applied.append(f"router:{strategy_label}:{_ll_label}")
+            if compressed_details is not None:
+                compressed_details.append(f"{details_prefix}:{_ll_label}:{_ll_ratio:.2f}")
+            if route_counts is not None:
+                route_counts["lossless_accept"] = (
+                    route_counts.get("lossless_accept", 0) + 1
+                )
+            return result.compressed, True
         if result.compression_ratio < min_ratio:
             # Tool ground truth must stay reversible: a lossy summarizer
             # (kompress/text/code) that emitted no CCR retrieve marker is
