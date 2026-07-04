@@ -109,3 +109,77 @@ def test_info_preserving_reconstruction_multiref():
     out, stats = dedup_blocks(blocks)
     assert stats["spans_folded"] == 2
     _reconstruct(blocks, out)
+
+
+# --------------------------------------------------------------------------
+# Integration: full router.apply() path (content-block tool_result format)
+# --------------------------------------------------------------------------
+def _mk_tok():
+    from headroom.providers import OpenAIProvider
+    from headroom.tokenizer import Tokenizer
+    return Tokenizer(OpenAIProvider().get_token_counter("gpt-4o"), "gpt-4o")
+
+
+def _toolmsg(text, tid):
+    return {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tid, "content": text}]}
+
+
+def _apply_fresh(messages):
+    # Fresh router per call: tests the pure-function (prefix-monotonic) property,
+    # not cross-call cache state.
+    from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
+    import copy
+    r = ContentRouter(ContentRouterConfig(lossless=True, enable_cross_turn_dedup=True))
+    return r.apply(copy.deepcopy(messages), _mk_tok()).messages
+
+
+def test_apply_dedups_reread_and_keeps_prefix_stable():
+    span = "\n".join(
+        f"    result_{i} = compute_overdraft(business_id={i}, amount={i * 100})"
+        for i in range(12)
+    )
+    m1 = [
+        {"role": "user", "content": "fix the overdraft bug"},
+        {"role": "assistant", "content": "cat merge.py"},
+        _toolmsg(f"$ cat merge.py\n{span}\n# end", "t1"),
+    ]
+    m2 = m1 + [
+        {"role": "assistant", "content": "sed -n range"},
+        _toolmsg(f"$ sed -n 1,20p merge.py\n{span}\n# more", "t2"),
+    ]
+    out1 = _apply_fresh(m1)
+    out2 = _apply_fresh(m2)
+
+    # Dedup fired on the later re-read (turn t2), earliest (t1) untouched.
+    later = out2[-1]["content"][0]["content"]
+    earlier = out2[2]["content"][0]["content"]
+    assert "[headroom:" in later
+    assert "[headroom:" not in earlier and span in earlier
+
+    # CACHE-SAFETY at the router level: appending turn t2 did NOT change any
+    # earlier message's emitted bytes → the prompt-cache prefix is stable.
+    def _tool_texts(msgs):
+        return [
+            b["content"]
+            for m in msgs
+            if isinstance(m.get("content"), list)
+            for b in m["content"]
+            if isinstance(b, dict) and b.get("type") == "tool_result"
+        ]
+    assert _tool_texts(out2)[:1] == _tool_texts(out1)  # t1 block byte-identical
+
+
+def test_apply_no_dedup_when_flag_off():
+    span = "\n".join(f"    v_{i} = f({i})" for i in range(12))
+    from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
+    import copy
+    msgs = [
+        _toolmsg(f"a\n{span}", "t1"),
+        _toolmsg(f"b\n{span}", "t2"),
+    ]
+    r = ContentRouter(ContentRouterConfig(lossless=True, enable_cross_turn_dedup=False))
+    out = r.apply(copy.deepcopy(msgs), _mk_tok()).messages
+    joined = "".join(
+        b["content"] for m in out for b in m["content"] if isinstance(b, dict)
+    )
+    assert "[headroom:" not in joined

@@ -873,6 +873,13 @@ class ContentRouterConfig:
     # emits a `<<ccr:…>>` / `Retrieve …` retrieval marker. SmartCrusher is
     # additionally forced marker-free via smart_crusher_lossless_only.
     lossless: bool = False
+    # Cross-turn (whole-conversation) verbatim de-dup. Replaces a contiguous span
+    # in a later tool output that already appeared verbatim in an earlier tool
+    # output with an in-context pointer. Prefix-monotonic (cache-safe) and
+    # information-preserving (the original stays in context). Env: HEADROOM_DEDUPE=1.
+    # Only runs alongside lossless mode, where code stays verbatim so references
+    # never resolve to degraded content.
+    enable_cross_turn_dedup: bool = False
     min_section_tokens: int = 20  # Min tokens to compress a section
 
     # Fallback: Kompress handles unknown/mixed content instead of passing through
@@ -1317,6 +1324,13 @@ class ContentRouter(Transform):
             "HEADROOM_TEXT_CRUSHER", ""
         ).strip().lower() in ("1", "true", "yes", "on")
         self._text_crusher: Any = None
+        # Cross-turn dedup: config field OR env HEADROOM_DEDUPE (robust to how the
+        # config was built). Effective only in lossless mode (guarded in apply()).
+        self._cross_turn_dedup_enabled: bool = (
+            self.config.enable_cross_turn_dedup
+            or os.environ.get("HEADROOM_DEDUPE", "").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
 
         # TOIN integration for cross-strategy learning
         self._toin: Any = None
@@ -3545,6 +3559,15 @@ class ContentRouter(Transform):
         # Build final message list from slots
         transformed_messages = [m for m in result_slots if m is not None]
 
+        # Cross-turn (whole-conversation) verbatim de-dup, over the final block
+        # forms. Only in lossless mode, where code stays verbatim so in-context
+        # references never resolve to degraded content. Prefix-monotonic → no
+        # prompt-cache bust (frozen + cache_control blocks are never rewritten).
+        if self._cross_turn_dedup_enabled and self.config.lossless:
+            transformed_messages = self._cross_turn_dedup_messages(
+                transformed_messages, frozen_message_count, transforms_applied, route_counts
+            )
+
         tokens_after = sum(
             tokenizer.count_text(str(m.get("content", ""))) for m in transformed_messages
         )
@@ -3722,6 +3745,84 @@ class ContentRouter(Transform):
             return profile.bias
 
         return 1.0  # Default: moderate
+
+    def _cross_turn_dedup_messages(
+        self,
+        messages: list[dict[str, Any]],
+        frozen_message_count: int,
+        transforms_applied: list[str],
+        route_counts: dict[str, int] | None,
+    ) -> list[dict[str, Any]]:
+        """Whole-conversation verbatim de-dup pass (cache-safe, information-lossless).
+
+        Runs AFTER per-block compression, over the final message forms: a span in
+        a later tool output that appeared verbatim in an earlier tool output is
+        replaced by an in-context pointer to the original. Frozen-prefix and
+        cache_control blocks are reference targets only (never rewritten), so no
+        cached bytes change. Because per-block compression here is a pure function
+        of content (excluded_tool_ids is empty for bash agents, so there is no
+        position-dependent gate), the rewrite is prefix-monotonic → the upstream
+        prompt-cache prefix stays byte-stable across turns. Never raises.
+        """
+        try:
+            from headroom.transforms.cross_turn_dedup import DedupBlock, dedup_blocks
+
+            locs: list[tuple[int, int | None]] = []
+            dblocks: list[DedupBlock] = []
+            for i, msg in enumerate(messages):
+                content = msg.get("content")
+                frozen = i < frozen_message_count
+                if isinstance(content, list):
+                    for bidx, block in enumerate(content):
+                        if not isinstance(block, dict) or block.get("type") != "tool_result":
+                            continue
+                        text = block.get("content")
+                        if not isinstance(text, str) or not text:
+                            continue
+                        protected = frozen or ("cache_control" in block)
+                        locs.append((i, bidx))
+                        dblocks.append(DedupBlock(text=text, turn=i, protected=protected))
+                elif isinstance(content, str) and msg.get("role") == "tool":
+                    if not content:
+                        continue
+                    protected = frozen or ("cache_control" in msg)
+                    locs.append((i, None))
+                    dblocks.append(DedupBlock(text=content, turn=i, protected=protected))
+
+            if len(dblocks) < 2:
+                return messages
+            deduped, stats = dedup_blocks(dblocks)
+            if not stats.get("spans_folded"):
+                return messages
+
+            new_messages = list(messages)
+            touched: dict[int, dict[str, Any]] = {}
+            for (mi, bidx), od, nd in zip(locs, dblocks, deduped):
+                if od.protected or nd.text == od.text:
+                    continue
+                if mi not in touched:
+                    src = new_messages[mi]
+                    copy = dict(src)
+                    if isinstance(src.get("content"), list):
+                        copy["content"] = [
+                            dict(b) if isinstance(b, dict) else b for b in src["content"]
+                        ]
+                    touched[mi] = copy
+                    new_messages[mi] = copy
+                m = touched[mi]
+                if bidx is None:
+                    m["content"] = nd.text
+                else:
+                    m["content"][bidx]["content"] = nd.text
+
+            if route_counts is not None:
+                route_counts["cross_turn_dedup"] = (
+                    route_counts.get("cross_turn_dedup", 0) + stats["spans_folded"]
+                )
+            transforms_applied.append(f"router:cross_turn_dedup:{stats['spans_folded']}")
+            return new_messages
+        except Exception:  # never break the proxy
+            return messages
 
     def _process_content_blocks(
         self,
