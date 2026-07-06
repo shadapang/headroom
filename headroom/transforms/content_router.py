@@ -881,7 +881,7 @@ class ContentRouterConfig:
     # references the earlier block's kompressed-but-CCR-recoverable form
     # (deterministic content-hash → stable → still cache-safe, no added loss).
     enable_cross_turn_dedup: bool = False
-    # A7: lossless-then-lossy. In lossy mode (not `lossless`), after a byte/data
+    # Lossless-then-lossy. In lossy mode (not `lossless`), after a byte/data
     # lossless fold (search/log/text) run the aggressive lossy compressor
     # (Kompress) on the FOLDED remainder and keep it iff it removes a further
     # meaningful chunk — recovering the semantic word-drop that plain lossless
@@ -1266,15 +1266,15 @@ class ContentRouter(Transform):
         }
     )
 
-    # A7 (lossless-then-lossy): the lossy pass replaces the byte-exact fold only
-    # if it removes a further meaningful chunk — Kompress output must be <= this
-    # fraction of the fold's tokens (default 0.95 => >= 5% additional reduction).
-    # Below that the marginal lossy gain isn't worth the accuracy cost when a
-    # lossless fold is already in hand, so the pure fold is kept. Overridable at
-    # runtime via env HEADROOM_A7_MIN_LOSSY_GAIN (read in __init__) so the gate
-    # can be tuned per deployment without a code edit + overlay rebuild. Lower =
-    # stricter (fewer lossy chains, safer); higher/1.0 = fire on any improvement.
-    _A7_MIN_LOSSY_GAIN = 0.95
+    # Lossless-then-lossy gate: the lossy pass replaces the byte-exact fold only
+    # if it saves at least this fraction MORE tokens than the fold already did
+    # (default 0.05 => Kompress must cut >= 5% beyond the fold). Below that the
+    # marginal lossy win isn't worth the accuracy cost when a lossless fold is
+    # already in hand, so the pure fold is kept. Overridable at runtime via env
+    # HEADROOM_LOSSY_MIN_EXTRA_SAVINGS (read in __init__) so the gate can be tuned
+    # per deployment without a code edit + overlay rebuild. Higher = stricter
+    # (fewer lossy chains, safer); 0 = keep the lossy pass on any improvement.
+    _DEFAULT_LOSSY_MIN_EXTRA_SAVINGS = 0.05
 
     def __init__(
         self,
@@ -1349,20 +1349,22 @@ class ContentRouter(Transform):
             self.config.enable_cross_turn_dedup
             or os.environ.get("HEADROOM_DEDUPE", "").strip().lower() in ("1", "true", "yes", "on")
         )
-        # A7: lossless-then-lossy. Config field OR env HEADROOM_LOSSLESS_THEN_LOSSY.
+        # Lossless-then-lossy. Config field OR env HEADROOM_LOSSLESS_THEN_LOSSY.
         # Only takes effect in lossy mode (STAGE 0 guards on `not config.lossless`).
         self._lossless_then_lossy: bool = self.config.lossless_then_lossy or os.environ.get(
             "HEADROOM_LOSSLESS_THEN_LOSSY", ""
         ).strip().lower() in ("1", "true", "yes", "on")
-        # A7 gate: keep the lossy chain only if Kompress <= this fraction of the
-        # fold's tokens. Env override (HEADROOM_A7_MIN_LOSSY_GAIN) falls back to
-        # the class default; a malformed value falls back rather than crashing.
+        # Lossless-then-lossy gate: keep the lossy chain only if it saves at least
+        # this fraction MORE than the fold. Env override
+        # (HEADROOM_LOSSY_MIN_EXTRA_SAVINGS) falls back to the class default; a
+        # malformed value falls back rather than crashing.
         try:
-            self._a7_min_lossy_gain: float = float(
-                os.environ.get("HEADROOM_A7_MIN_LOSSY_GAIN") or self._A7_MIN_LOSSY_GAIN
+            self._lossy_min_extra_savings: float = float(
+                os.environ.get("HEADROOM_LOSSY_MIN_EXTRA_SAVINGS")
+                or self._DEFAULT_LOSSY_MIN_EXTRA_SAVINGS
             )
         except (TypeError, ValueError):
-            self._a7_min_lossy_gain = self._A7_MIN_LOSSY_GAIN
+            self._lossy_min_extra_savings = self._DEFAULT_LOSSY_MIN_EXTRA_SAVINGS
 
         # TOIN integration for cross-strategy learning
         self._toin: Any = None
@@ -1839,8 +1841,8 @@ class ContentRouter(Transform):
     def _looks_like_diff(content: str) -> bool:
         """Cheap structural sniff for unified/git-diff content.
 
-        Used to keep A7's lossy pass (Kompress) OFF diff content — Kompressing
-        hunks corrupts ``git apply``. This is defense-in-depth beyond the
+        Used to keep the lossy-after-fold pass (Kompress) OFF diff content —
+        Kompressing hunks corrupts ``git apply``. This is defense-in-depth beyond the
         DIFF-strategy and ``lossless_diff``-label checks: a diff can be folded
         best under a non-diff label (e.g. blank-line collapse → ``lossless_text``)
         or mis-detected, and must still never reach the lossy stage.
@@ -1950,30 +1952,30 @@ class ContentRouter(Transform):
                 return split, len(split.split()), [kind, "relevance_split"]
 
         # No relevance split adopted → return the STAGE 0 lossless fold as the
-        # floor. A7 (lossless-then-lossy): before returning, run the aggressive
-        # lossy compressor on the byte-folded remainder and keep it IFF it removes
-        # a further meaningful chunk (Kompress tokens <= _a7_min_lossy_gain * fold
-        # tokens). Keeps the fold AND reclaims the semantic word-drop tail, never
-        # doing worse than the fold. DIFF folds are returned verbatim —
-        # Kompressing hunks corrupts `git apply`.
+        # floor. Lossless-then-lossy: before returning, run the aggressive lossy
+        # compressor on the byte-folded remainder and keep it IFF it removes a
+        # further meaningful chunk (Kompress must save >= _lossy_min_extra_savings
+        # beyond the fold). Keeps the fold AND reclaims the semantic word-drop
+        # tail, never doing worse than the fold. DIFF folds are returned verbatim
+        # — Kompressing hunks corrupts `git apply`.
         if _ll_label is not None:
-            _a7 = (
+            _lossy_after_fold = (
                 self._lossless_then_lossy
                 and strategy != CompressionStrategy.DIFF
                 and _ll_label != "lossless_diff"
                 and not self._looks_like_diff(content)
             )
-            if _a7:
+            if _lossy_after_fold:
                 _fold_tokens = len(_ll_content.split())
                 try:
                     _komp, _komp_tokens = self._try_ml_compressor(_ll_content, context, question)
                 except Exception as exc:  # noqa: BLE001
-                    logger.debug("A7 lossy-after-fold failed: %s", exc)
+                    logger.debug("lossy-after-fold failed: %s", exc)
                     _komp, _komp_tokens = None, None
                 if (
                     _komp is not None
                     and _komp_tokens is not None
-                    and _komp_tokens <= _fold_tokens * self._a7_min_lossy_gain
+                    and _komp_tokens <= _fold_tokens * (1 - self._lossy_min_extra_savings)
                     and len(_komp) < len(_ll_content)
                 ):
                     return (
@@ -4279,12 +4281,12 @@ class ContentRouter(Transform):
         #
         # Two shapes take this path:
         #   • Pure fold  (chain == [lossless_*])           — byte-exact, always safe.
-        #   • A7 fold+lossy (chain == [lossless_*, kompress]) — accepted on bytes
+        #   • Fold+lossy (chain == [lossless_*, kompress]) — accepted on bytes
         #     ONLY in no-CCR mode (config.ccr_inject_marker=False), where unmarked
         #     lossy is the deliberate output. The byte-exact fold is the floor, so
         #     the block is guaranteed to shrink and never falls below the fold.
         # A pure fold bypasses the lossy-unmarked reversibility guard (it is
-        # recoverable); the A7 lossy-tail case only reaches here when markers are
+        # recoverable); the fold+lossy tail case only reaches here when markers are
         # off, where that guard is a no-op anyway.
         _chain = getattr(result, "strategy_chain", None) or []
         _starts_lossless = bool(_chain) and _chain[0].startswith("lossless_")

@@ -1,10 +1,11 @@
-"""A7: lossless-then-lossy dispatch.
+"""Lossless-then-lossy dispatch.
 
 In lossy mode (``lossless=False``) with ``lossless_then_lossy`` on, a foldable
 block is FIRST byte-folded losslessly and THEN handed to the aggressive lossy
 compressor (Kompress) on the folded remainder. The lossy result is kept only
-when it removes a further meaningful chunk (>= 10% fewer tokens than the fold);
-otherwise the pure byte-exact fold is kept, so A7 is never worse than A6.
+when it saves at least ``lossy_min_extra_savings`` MORE than the fold already
+did; otherwise the pure byte-exact fold is kept, so it is never worse than the
+plain fold.
 
 DIFF content is never lossy-chained (Kompressing hunks breaks ``git apply``).
 Kompress is mocked so these run without the ModernBERT model.
@@ -86,9 +87,9 @@ def _run(r, content):
     return out, was, tr, rc
 
 
-def test_a7_chains_fold_then_kompress_when_lossy_helps():
+def test_lossy_after_fold_chains_when_it_helps():
     block = _grep_block()
-    # kompress removes >=10% more tokens than the fold → lossy result is kept.
+    # kompress removes far more than the min-extra-savings floor → lossy kept.
     r, calls = _router(lossless_then_lossy=True, kompress=lambda c: "TINY")
     out, was, tr, rc = _run(r, block)
     assert was is True
@@ -99,7 +100,7 @@ def test_a7_chains_fold_then_kompress_when_lossy_helps():
     assert tr == ["router:tool_result:lossless_search+kompress"]
 
 
-def test_a7_keeps_pure_fold_when_lossy_marginal():
+def test_keeps_pure_fold_when_lossy_marginal():
     block = _grep_block()
     # kompress returns the fold unchanged (no gain) → pure byte-exact fold kept.
     r, calls = _router(lossless_then_lossy=True, kompress=lambda c: c)
@@ -111,9 +112,9 @@ def test_a7_keeps_pure_fold_when_lossy_marginal():
     assert search_unheading(out) == block  # fully recoverable (byte-exact)
 
 
-def test_a7_never_kompresses_diff():
+def test_never_kompresses_diff():
     block = _diff_block()
-    # kompress would mangle a diff; A7 must never call it on diff content.
+    # kompress would mangle a diff; the lossy pass must never touch diff content.
     r, calls = _router(lossless_then_lossy=True, kompress=lambda c: "MANGLED")
     out, was, tr, rc = _run(r, block)
     assert was is True
@@ -123,55 +124,54 @@ def test_a7_never_kompresses_diff():
     assert "new_foo = 2" in out  # hunk bodies intact → still applies
 
 
-def test_a7_off_is_a6_pure_fold():
+def test_lossy_after_fold_off_is_pure_fold():
     block = _grep_block()
     r, calls = _router(lossless_then_lossy=False, kompress=lambda c: "TINY")
     out, was, tr, rc = _run(r, block)
     assert was is True
-    assert calls == []  # no lossy pass when A7 disabled
+    assert calls == []  # no lossy pass when lossless-then-lossy is disabled
     assert rc.get("lossless_accept") == 1
     assert search_unheading(out) == block
 
 
-def test_a7_never_worse_than_a6():
+def test_lossy_after_fold_never_worse_than_pure_fold():
     block = _grep_block()
-    r6, _ = _router(lossless_then_lossy=False, kompress=lambda c: "TINY")
-    r7, _ = _router(lossless_then_lossy=True, kompress=lambda c: "TINY")
-    out6, _, _, _ = _run(r6, block)
-    out7, _, _, _ = _run(r7, block)
-    assert len(out7) <= len(out6)  # A7 >= A6 compression, always
+    r_fold, _ = _router(lossless_then_lossy=False, kompress=lambda c: "TINY")
+    r_chain, _ = _router(lossless_then_lossy=True, kompress=lambda c: "TINY")
+    out_fold, _, _, _ = _run(r_fold, block)
+    out_chain, _, _, _ = _run(r_chain, block)
+    assert len(out_chain) <= len(out_fold)  # chaining never loses to the pure fold
 
 
-def test_a7_gain_gate_boundary_default_095(monkeypatch):
-    monkeypatch.delenv("HEADROOM_A7_MIN_LOSSY_GAIN", raising=False)
+def test_lossy_gate_boundary_default(monkeypatch):
+    monkeypatch.delenv("HEADROOM_LOSSY_MIN_EXTRA_SAVINGS", raising=False)
     block = _grep_block()
     r, _ = _router(lossless_then_lossy=True)
-    assert abs(r._a7_min_lossy_gain - 0.95) < 1e-9  # default is 0.95
+    assert abs(r._lossy_min_extra_savings - 0.05) < 1e-9  # default: require >=5% extra
     fold_tok = len(r._lossless_first(block, CompressionStrategy.SEARCH)[0].split())
-    # Kompress that removes ~6% of fold tokens -> ratio ~0.94 <= 0.95 -> chained.
+    # Kompress that keeps 94% of fold tokens -> saves 6% >= the 5% floor -> chained.
     keep = int(fold_tok * 0.94)
     r._try_ml_compressor = lambda c, ctx, q=None: (" ".join(["w"] * keep), keep)  # type: ignore
     _, was, tr, rc = _run(r, block)
     assert was is True and rc.get("lossless_then_lossy_accept") == 1
-    # Same result would be REJECTED under the old 0.90 gate (0.94 > 0.90).
 
 
-def test_a7_gain_gate_env_override(monkeypatch):
-    monkeypatch.setenv("HEADROOM_A7_MIN_LOSSY_GAIN", "0.80")
+def test_lossy_gate_env_override(monkeypatch):
+    monkeypatch.setenv("HEADROOM_LOSSY_MIN_EXTRA_SAVINGS", "0.20")
     r, _ = _router(lossless_then_lossy=True)
-    assert abs(r._a7_min_lossy_gain - 0.80) < 1e-9  # env override wins
+    assert abs(r._lossy_min_extra_savings - 0.20) < 1e-9  # env override wins
     block = _grep_block()
     fold_tok = len(r._lossless_first(block, CompressionStrategy.SEARCH)[0].split())
-    keep = int(fold_tok * 0.90)  # 10% cut: passes 0.95 default but FAILS the 0.80 override
+    keep = int(fold_tok * 0.90)  # saves 10%: passes the 5% default but FAILS the 20% override
     r._try_ml_compressor = lambda c, ctx, q=None: (" ".join(["w"] * keep), keep)  # type: ignore
     _, was, tr, rc = _run(r, block)
-    assert rc.get("lossless_accept") == 1  # kept pure fold under strict 0.80 gate
+    assert rc.get("lossless_accept") == 1  # kept pure fold under the stricter 20% gate
     assert rc.get("lossless_then_lossy_accept", 0) == 0
 
 
-def test_a7_noop_in_lossless_only_mode():
+def test_lossy_after_fold_noop_in_lossless_only_mode():
     block = _grep_block()
-    # lossless-only mode ignores A7 (never emits lossy) even if the flag is set.
+    # lossless-only mode never emits lossy even if lossless-then-lossy is set.
     r, calls = _router(lossless_then_lossy=True, lossless=True, kompress=lambda c: "TINY")
     out, was, tr, rc = _run(r, block)
     assert was is True
