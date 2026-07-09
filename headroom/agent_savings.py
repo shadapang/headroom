@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import MutableMapping
 from dataclasses import dataclass, replace
 from typing import Protocol
 
@@ -98,7 +99,7 @@ class AgentSavingsProfile:
             env["HEADROOM_MIN_CHARS_FOR_BLOCK"] = str(self.min_chars_for_block)
         return env
 
-    def apply_proxy_env_defaults(self, env: dict[str, str]) -> dict[str, str]:
+    def apply_proxy_env_defaults(self, env: MutableMapping[str, str]) -> MutableMapping[str, str]:
         """Seed proxy env defaults without overriding explicit user settings."""
 
         for key, value in self.proxy_env().items():
@@ -224,9 +225,9 @@ def get_agent_savings_profile(name: str | None = None) -> AgentSavingsProfile:
 
 
 def apply_agent_savings_env_defaults(
-    env: dict[str, str],
+    env: MutableMapping[str, str],
     profile: AgentSavingsProfile | str | None = None,
-) -> dict[str, str]:
+) -> MutableMapping[str, str]:
     """Apply agent savings env defaults to a proxy subprocess environment.
 
     When ``profile`` is not given, an explicit ``HEADROOM_SAVINGS_PROFILE`` already
@@ -345,7 +346,7 @@ def proxy_pipeline_kwargs(config: object) -> dict[str, object]:
     return kwargs
 
 
-def seed_proxy_env_defaults(env: dict[str, str] | None = None) -> None:
+def seed_proxy_env_defaults(env: MutableMapping[str, str] | None = None) -> None:
     """Seed the process env with the savings-profile defaults (default: coding).
 
     Call at proxy EXECUTABLE entry points (the ``headroom proxy`` command and the
