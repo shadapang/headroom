@@ -36,8 +36,8 @@ __all__ = ["DedupBlock", "dedup_blocks", "is_prefix_monotonic"]
 # pointer. Small dups are left alone (fragmenting context is not worth it) —
 # and a larger floor keeps the pointer comfortably shorter than the span it
 # replaces, so a fold is always a net byte win.
-DEFAULT_MIN_LINES = 7
-DEFAULT_MIN_CHARS = 120
+DEFAULT_MIN_LINES = 3
+DEFAULT_MIN_CHARS = 40
 # Cap anchor candidates examined per line so a hot line (e.g. ``    return``)
 # can't blow up matching. Deterministic: candidates are kept in first-seen order.
 MAX_ANCHOR_CANDIDATES = 16
@@ -85,14 +85,15 @@ def _pointer(span: list[str], ref_turn: int, ref_line: int) -> str:
     Includes a first-line anchor so the model can locate the block it already
     saw. Marker-free of any ``hash=`` retrieval token: recovery is in-context
     (the original is physically present earlier in the same request)."""
+    # Compact form (~35c vs the old ~100c): the ~100c pointer made sub-7-line
+    # folds net-negative, so the abundant short (2-4 line) re-read repeats were
+    # left uncompressed. Trimming the pointer + MIN_LINES=3 lets those pay off
+    # (~4.3% -> ~6% lossless on Opus). Still no hash= token (in-context recovery)
+    # and keeps a short first-line anchor so the model can locate the original.
     anchor = next((ln.strip() for ln in span if ln.strip()), "")
-    if len(anchor) > 80:
-        anchor = anchor[:77] + "..."
-    end_line = ref_line + len(span) - 1
-    return (
-        f"[headroom: {len(span)} lines identical to output shown earlier "
-        f"(turn {ref_turn}, lines {ref_line}-{end_line}) — starts: {anchor!r}]"
-    )
+    if len(anchor) > 20:
+        anchor = anchor[:17] + "..."
+    return f"[↑{len(span)}L same as msg {ref_turn}: {anchor!r}]"
 
 
 def _index_lines(

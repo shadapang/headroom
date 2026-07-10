@@ -4235,7 +4235,7 @@ class ContentRouter(Transform):
         try:
             from headroom.transforms.cross_turn_dedup import DedupBlock, dedup_blocks
 
-            locs: list[tuple[int, int | None]] = []
+            locs: list[tuple[int, int | None, int | None]] = []
             dblocks: list[DedupBlock] = []
             for i, msg in enumerate(messages):
                 content = msg.get("content")
@@ -4244,17 +4244,37 @@ class ContentRouter(Transform):
                     for bidx, block in enumerate(content):
                         if not isinstance(block, dict) or block.get("type") != "tool_result":
                             continue
-                        text = block.get("content")
-                        if not isinstance(text, str) or not text:
-                            continue
+                        tc = block.get("content")
                         protected = frozen or ("cache_control" in block)
-                        locs.append((i, bidx))
-                        dblocks.append(DedupBlock(text=text, turn=i, protected=protected))
+                        if isinstance(tc, str) and tc:
+                            locs.append((i, bidx, None))
+                            dblocks.append(DedupBlock(text=tc, turn=i, protected=protected))
+                        elif isinstance(tc, list):
+                            # Anthropic tool_result carries LIST content (a `text`
+                            # sub-block holds the bash/read output). The string-only
+                            # path above skipped these entirely, so reads never
+                            # deduped on Anthropic models. Dedup the single text
+                            # sub-block (the common form); leave multi-text/mixed
+                            # blocks verbatim to stay trivially lossless.
+                            text_subs = [
+                                (si, sub)
+                                for si, sub in enumerate(tc)
+                                if isinstance(sub, dict)
+                                and sub.get("type") == "text"
+                                and isinstance(sub.get("text"), str)
+                                and sub.get("text")
+                            ]
+                            if len(text_subs) == 1:
+                                si, sub = text_subs[0]
+                                locs.append((i, bidx, si))
+                                dblocks.append(
+                                    DedupBlock(text=sub["text"], turn=i, protected=protected)
+                                )
                 elif isinstance(content, str) and msg.get("role") == "tool":
                     if not content:
                         continue
                     protected = frozen or ("cache_control" in msg)
-                    locs.append((i, None))
+                    locs.append((i, None, None))
                     dblocks.append(DedupBlock(text=content, turn=i, protected=protected))
 
             if len(dblocks) < 2:
@@ -4265,7 +4285,7 @@ class ContentRouter(Transform):
 
             new_messages = list(messages)
             touched: dict[int, dict[str, Any]] = {}
-            for (mi, blk_idx), od, nd in zip(locs, dblocks, deduped):
+            for (mi, blk_idx, sub_idx), od, nd in zip(locs, dblocks, deduped):
                 if od.protected or nd.text == od.text:
                     continue
                 if mi not in touched:
@@ -4280,8 +4300,19 @@ class ContentRouter(Transform):
                 m = touched[mi]
                 if blk_idx is None:
                     m["content"] = nd.text
-                else:
+                elif sub_idx is None:
                     m["content"][blk_idx]["content"] = nd.text
+                else:
+                    # List-content tool_result: deep-copy the block + its sub-list
+                    # before mutating so the input message is never touched.
+                    blk = dict(m["content"][blk_idx])
+                    sub_list = [
+                        dict(s) if isinstance(s, dict) else s for s in blk.get("content", [])
+                    ]
+                    sub_list[sub_idx] = dict(sub_list[sub_idx])
+                    sub_list[sub_idx]["text"] = nd.text
+                    blk["content"] = sub_list
+                    m["content"][blk_idx] = blk
 
             if route_counts is not None:
                 route_counts["cross_turn_dedup"] = (
