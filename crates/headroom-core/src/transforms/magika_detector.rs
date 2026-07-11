@@ -35,6 +35,10 @@
 //!   error early instead of crashing with SIGILL; the detection chain then
 //!   falls through to Tier 2 and Tier 3 normally.
 
+#[cfg(any(
+    target_os = "windows",
+    all(target_os = "macos", target_arch = "x86_64")
+))]
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
