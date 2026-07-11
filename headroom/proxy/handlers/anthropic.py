@@ -2187,6 +2187,16 @@ class AnthropicHandlerMixin:
                         f"router:tool_search_deferral:{len(_ts_deferred)}tools:"
                         f"{_ts_saved_tokens}tok"
                     )
+                    # Report the per-turn deferred-schema tokens to the extension-
+                    # savings counter so /stats + the dashboard attribute this to
+                    # Headroom's tool-search — the client would otherwise re-send
+                    # every schema each turn. Guarded: older metrics lack the API.
+                    _rec = getattr(self.metrics, "record_extension_savings", None)
+                    if _rec is not None:
+                        try:
+                            _rec("tool_search", _ts_saved_tokens)
+                        except Exception:  # pragma: no cover - never break the turn
+                            pass
 
             # Turn hooks (opt-in extensions): a registered hook may inspect or
             # rewrite the outbound tools/messages before we send upstream — the

@@ -89,3 +89,44 @@ def test_json_equivalence_accepts_reformat_rejects_mutation():
     clear_lossless_providers()
     register_lossless_provider(Liar())
     assert best_provider_fold(pretty, LosslessCtx()) is None  # value mutation rejected
+
+
+def test_lossless_first_records_provider_delta_to_observer():
+    # When a provider beats the built-in folds, ContentRouter records its INCREMENTAL
+    # (beyond-stock) savings to the observer under the provider's label.
+    from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
+
+    class FakeObserver:
+        def __init__(self):
+            self.ext: dict[str, int] = {}
+
+        def record_compression(self, strategy, original_tokens, compressed_tokens):
+            pass
+
+        def record_router_route_counts(self, counts):
+            pass
+
+        def record_extension_savings(self, name, tokens_saved):
+            self.ext[name] = self.ext.get(name, 0) + tokens_saved
+
+    class JsonProvider:
+        name = "demo_provider"
+
+        def propose(self, content, ctx):
+            try:
+                obj = json.loads(content)
+            except (ValueError, TypeError):
+                return None
+            compact = json.dumps(obj, separators=(",", ":"))
+            if len(compact) >= len(content):
+                return None
+            return Compaction(
+                text=compact, recover=lambda: compact, equivalence="json", label="demo_provider"
+            )
+
+    obs = FakeObserver()
+    router = ContentRouter(ContentRouterConfig(lossless=True), observer=obs)
+    register_lossless_provider(JsonProvider())
+    pretty = json.dumps([{"id": i, "name": f"n{i}", "ok": True} for i in range(12)], indent=2)
+    router.compress(pretty, context="")
+    assert obs.ext.get("demo_provider", 0) > 0  # incremental beyond-stock savings recorded
