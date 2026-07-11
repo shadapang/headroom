@@ -86,6 +86,7 @@ _OPENAI_RESPONSES_OUTPUT_ITEM_TYPES = frozenset(
 
 _replace_or_append_steering_block = replace_or_append_steering_block
 
+
 class TurnKind(Enum):
     """Structural classification of the latest conversation turn."""
 
