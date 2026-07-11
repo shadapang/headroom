@@ -24,6 +24,16 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 from headroom import paths as _paths
 from headroom._subprocess import run
+from headroom.proxy.beta_header_merge import (
+    merge_anthropic_beta as merge_anthropic_beta,
+)
+from headroom.proxy.beta_header_merge import (
+    merge_beta_tokens,
+    split_beta_tokens,
+)
+from headroom.proxy.beta_header_merge import (
+    merge_openai_beta as merge_openai_beta,
+)
 from headroom.proxy.body_forwarding import (
     BodyMutationTracker as BodyMutationTracker,  # noqa: F401 - compatibility export
 )
@@ -37,16 +47,6 @@ from headroom.proxy.body_forwarding import (
     prepare_outbound_body_bytes as prepare_outbound_body_bytes,  # noqa: F401 - compatibility export
 )
 from headroom.proxy.body_forwarding import serialize_body_canonical
-from headroom.proxy.beta_header_merge import (
-    merge_anthropic_beta as merge_anthropic_beta,
-)
-from headroom.proxy.beta_header_merge import (
-    merge_beta_tokens,
-    split_beta_tokens,
-)
-from headroom.proxy.beta_header_merge import (
-    merge_openai_beta as merge_openai_beta,
-)
 
 if TYPE_CHECKING:
     import httpx
