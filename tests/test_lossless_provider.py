@@ -91,6 +91,22 @@ def test_json_equivalence_accepts_reformat_rejects_mutation():
     assert best_provider_fold(pretty, LosslessCtx()) is None  # value mutation rejected
 
 
+def test_json_equivalence_rejects_bool_number_mutation():
+    class BoolToNumber:
+        name = "bool_to_number"
+
+        def propose(self, content, ctx):
+            return Compaction(
+                text='{"enabled":1}',
+                recover=lambda: '{"enabled":1}',
+                equivalence="json",
+                label="lossless_bool_to_number",
+            )
+
+    register_lossless_provider(BoolToNumber())
+    assert best_provider_fold('{"enabled":true}', LosslessCtx()) is None
+
+
 def test_lossless_first_records_provider_delta_to_observer():
     # When a provider beats the built-in folds, ContentRouter records its INCREMENTAL
     # (beyond-stock) savings to the observer under the provider's label.

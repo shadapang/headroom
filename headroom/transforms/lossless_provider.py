@@ -98,10 +98,48 @@ def _verify(content: str, c: Compaction) -> bool:
         return False
     if c.equivalence == "json":
         try:
-            return bool(json.loads(recovered) == json.loads(content))
+            return _json_values_equal(json.loads(recovered), json.loads(content))
         except (ValueError, TypeError):
             return False
     return recovered == content  # byte-exact
+
+
+def _json_values_equal(left: object, right: object) -> bool:
+    """JSON value equality with JSON type identity preserved.
+
+    Python's plain equality treats ``True == 1`` because ``bool`` subclasses
+    ``int``. That is not JSON value equality: booleans and numbers are distinct
+    JSON types, so a verified compaction must not be allowed to swap them.
+    """
+    if left is None or right is None:
+        return left is right
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left == right
+    if isinstance(left, int | float) or isinstance(right, int | float):
+        return (
+            isinstance(left, int | float)
+            and not isinstance(left, bool)
+            and isinstance(right, int | float)
+            and not isinstance(right, bool)
+            and left == right
+        )
+    if isinstance(left, str) or isinstance(right, str):
+        return isinstance(left, str) and isinstance(right, str) and left == right
+    if isinstance(left, list) or isinstance(right, list):
+        return (
+            isinstance(left, list)
+            and isinstance(right, list)
+            and len(left) == len(right)
+            and all(_json_values_equal(a, b) for a, b in zip(left, right))
+        )
+    if isinstance(left, dict) or isinstance(right, dict):
+        return (
+            isinstance(left, dict)
+            and isinstance(right, dict)
+            and left.keys() == right.keys()
+            and all(_json_values_equal(left[key], right[key]) for key in left)
+        )
+    return left == right
 
 
 def best_provider_fold(content: str, ctx: LosslessCtx) -> tuple[str, str] | None:
