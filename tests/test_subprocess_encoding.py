@@ -25,7 +25,7 @@ def _capture_run(captured, returncode=0, stdout='{"summary": {}}'):
 
 def test_rtk_stats_subprocess_uses_utf8(monkeypatch):
     captured: dict = {}
-    monkeypatch.setattr(helpers.subprocess, "run", _capture_run(captured))
+    monkeypatch.setattr(helpers, "run", _capture_run(captured))
     monkeypatch.setattr(headroom.rtk, "get_rtk_path", lambda: "/fake/rtk")
 
     helpers._read_rtk_lifetime_stats()
@@ -36,7 +36,7 @@ def test_rtk_stats_subprocess_uses_utf8(monkeypatch):
 
 def test_lean_ctx_stats_subprocess_uses_utf8(monkeypatch):
     captured: dict = {}
-    monkeypatch.setattr(helpers.subprocess, "run", _capture_run(captured))
+    monkeypatch.setattr(helpers, "run", _capture_run(captured))
     monkeypatch.setattr(headroom.lean_ctx, "get_lean_ctx_path", lambda: "/fake/lean-ctx")
 
     helpers._read_lean_ctx_lifetime_stats()
