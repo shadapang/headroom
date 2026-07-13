@@ -64,15 +64,15 @@ def test_agent_90_profile_exports_cross_agent_proxy_env() -> None:
     assert env["HEADROOM_ACCURACY_GUARD"] == "strict"
 
 
-def test_coding_persona_protects_working_set_and_stays_visible() -> None:
+def test_coding_persona_compresses_recent_delta_and_stays_visible() -> None:
     profile = get_agent_savings_profile("coding")
 
     env = profile.proxy_env()
 
     assert env["HEADROOM_SAVINGS_PROFILE"] == "coding"
     assert env["HEADROOM_MODE"] == "cache"  # delta-only compression at ~0 prefix-cache busts
-    assert env["HEADROOM_PROTECT_RECENT"] == "2"  # keep the active code working set verbatim
-    assert env["HEADROOM_MIN_TOKENS"] == "25"  # low → compression is actually visible
+    assert env["HEADROOM_PROTECT_RECENT"] == "0"  # reads guarded by type, not position
+    assert env["HEADROOM_MIN_TOKENS"] == "10"  # low → even modest deltas are eligible
     # Cache mode compresses the newest observation delta → compress_user must be ON.
     assert env["HEADROOM_COMPRESS_USER_MESSAGES"] == "1"
     assert env["HEADROOM_COMPRESS_SYSTEM_MESSAGES"] == "0"  # system prompt is the hottest cache
@@ -102,15 +102,15 @@ def test_general_persona_has_no_positional_code_protection() -> None:
 def test_personas_omit_target_ratio_in_pipeline_kwargs() -> None:
     # coding compresses the delta observation (cache mode) → compress_user True;
     # general has no positional code working set and leaves user turns intact.
-    for name, expected_protect, expected_compress_user in (
-        ("coding", 2, True),
-        ("general", 0, False),
+    for name, expected_protect, expected_compress_user, expected_min_tokens in (
+        ("coding", 0, True, 10),
+        ("general", 0, False, 25),
     ):
         kwargs = proxy_pipeline_kwargs(ProxyConfig(savings_profile=name))
 
         assert kwargs["protect_recent"] == expected_protect
         assert kwargs["read_protection_window"] == expected_protect
-        assert kwargs["min_tokens_to_compress"] == 25
+        assert kwargs["min_tokens_to_compress"] == expected_min_tokens
         assert kwargs["compress_user_messages"] is expected_compress_user
         assert kwargs["compress_system_messages"] is False
         assert kwargs["force_kompress"] is False
@@ -122,8 +122,8 @@ def test_persona_apply_profile_leaves_target_ratio_untouched() -> None:
 
     apply_agent_savings_profile(cfg, "coding")
 
-    assert cfg.protect_recent == 2
-    assert cfg.min_tokens_to_compress == 25
+    assert cfg.protect_recent == 0
+    assert cfg.min_tokens_to_compress == 10
     assert cfg.target_ratio == 0.42  # persona did not override an explicit ratio
 
 
