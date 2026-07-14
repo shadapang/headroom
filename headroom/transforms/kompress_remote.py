@@ -99,11 +99,13 @@ class RemoteKompressCompressor:
             )
             resp.raise_for_status()
             data = resp.json()
+            compressed = data["compressed"]
+            if not isinstance(compressed, str):
+                raise TypeError("remote Kompress response field 'compressed' must be a string")
         except Exception as e:  # fail OPEN — never break the proxy on a bad endpoint
             logger.warning("Remote Kompress failed (%s); passing through", e)
             return self._passthrough(content, n_words)
 
-        compressed = data["compressed"]
         result = KompressResult(
             compressed=compressed,
             original=content,
@@ -126,3 +128,6 @@ class RemoteKompressCompressor:
                 )
 
         return result
+
+    def close(self) -> None:
+        self._client.close()
