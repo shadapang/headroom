@@ -679,6 +679,66 @@ _rtk_option = click.option(
 )
 
 
+# --- Code-memory MCP selection ------------------------------------------------
+# The code-memory MCP is on by default (tokensave). Swap it with --code-memory
+# serena, or turn it off with --code-memory none. Selection flows through
+# HEADROOM_CODE_MEMORY (set by the eager --code-memory callback) so it works the
+# same on every agent without threading a param through each subcommand — the
+# same approach as _rtk_option above.
+_CODE_MEMORY_ENV = "HEADROOM_CODE_MEMORY"
+_CODE_MEMORY_TOKENSAVE = "tokensave"
+_CODE_MEMORY_SERENA = "serena"
+_CODE_MEMORY_NONE = "none"
+_VALID_CODE_MEMORY = {_CODE_MEMORY_TOKENSAVE, _CODE_MEMORY_SERENA, _CODE_MEMORY_NONE}
+
+
+def _resolve_code_memory(kwargs: dict[str, Any]) -> str:
+    """Resolve which code-memory MCP to register.
+
+    Precedence: the explicit selector (``--code-memory`` / ``HEADROOM_CODE_MEMORY``)
+    wins; otherwise the deprecated ``--serena`` / ``--no-tokensave`` / ``--no-serena``
+    flags map into it; otherwise the default is ``tokensave``.
+    """
+    env = os.environ.get(_CODE_MEMORY_ENV, "").strip().lower()
+    if env:
+        if env not in _VALID_CODE_MEMORY:
+            raise click.ClickException(
+                f"{_CODE_MEMORY_ENV} must be one of: {', '.join(sorted(_VALID_CODE_MEMORY))}"
+            )
+        return env
+    if kwargs.get("serena"):
+        return _CODE_MEMORY_SERENA
+    if kwargs.get("no_tokensave"):
+        return _CODE_MEMORY_NONE if kwargs.get("no_serena") else _CODE_MEMORY_SERENA
+    return _CODE_MEMORY_TOKENSAVE
+
+
+def _code_memory_flag_callback(ctx: Any, param: Any, value: str | None) -> str | None:
+    """Click eager callback: ``--code-memory X`` sets HEADROOM_CODE_MEMORY so the
+    central resolver (:func:`_resolve_code_memory`) sees the choice without
+    threading a param through every wrap subcommand."""
+    if value:
+        os.environ[_CODE_MEMORY_ENV] = value
+    return value
+
+
+# Shared selector applied to code-memory-capable subcommands (claude/codex/grok).
+# ``expose_value=False`` so no subcommand signature changes; it flows purely
+# through HEADROOM_CODE_MEMORY.
+_code_memory_option = click.option(
+    "--code-memory",
+    type=click.Choice([_CODE_MEMORY_TOKENSAVE, _CODE_MEMORY_SERENA, _CODE_MEMORY_NONE]),
+    default=None,
+    expose_value=False,
+    is_eager=True,
+    callback=_code_memory_flag_callback,
+    help=(
+        "Code-memory MCP to register: 'tokensave' (default), 'serena', or 'none'. "
+        "Also set by HEADROOM_CODE_MEMORY. Replaces --serena/--no-serena/--no-tokensave."
+    ),
+)
+
+
 def _setup_rtk(verbose: bool = False) -> Path | None:
     """Ensure rtk is installed and hooks are registered."""
     if not _rtk_opt_in():
@@ -1699,38 +1759,44 @@ def _disable_tokensave_mcp(registrar: Any, *, verbose: bool = False) -> None:
 
 
 def _setup_coding_compressor(registrar: Any, *, serena_context: str, **kwargs: Any) -> None:
-    """Set up the coding-task compressor: tokensave primary, Serena backup.
+    """Set up the code-memory MCP, selected via ``--code-memory`` (default tokensave).
 
-    Policy (decided per the integration):
+    Selection (see :func:`_resolve_code_memory`):
 
-    * ``no_tokensave`` — skip/disable tokensave entirely.
-    * tokensave is set up by default; on success it becomes the primary
-      compressor and any Headroom-installed Serena entry is removed.
-    * Serena is the backup: registered automatically when tokensave is
-      unavailable (unless ``no_serena``), or forced on with ``serena=True``.
+    * ``tokensave`` (default) — register tokensave; Serena is registered
+      automatically only as a backup when tokensave is unavailable (unless the
+      deprecated ``--no-serena`` suppressed the fallback).
+    * ``serena`` — register Serena and remove any Headroom-installed tokensave.
+    * ``none`` — remove both Headroom-installed entries.
 
-    ``kwargs`` carries the boolean flags ``serena``, ``no_serena``,
-    ``no_tokensave`` and the per-agent registrar ``force`` semantics.
+    Deprecated ``--serena`` / ``--no-serena`` / ``--no-tokensave`` flags map into
+    the selector. User-managed MCP entries are always left untouched (ledger).
     """
-    serena = bool(kwargs.get("serena"))
-    no_serena = bool(kwargs.get("no_serena"))
-    no_tokensave = bool(kwargs.get("no_tokensave"))
     force = bool(kwargs.get("force"))
     verbose = bool(kwargs.get("verbose"))
+    selection = _resolve_code_memory(kwargs)
+    # Deprecated --no-serena: in tokensave mode, don't auto-fall back to Serena.
+    suppress_serena_fallback = bool(kwargs.get("no_serena"))
 
-    tokensave_ok = False
-    if no_tokensave:
+    if selection == _CODE_MEMORY_NONE:
         _disable_tokensave_mcp(registrar, verbose=verbose)
-    else:
-        tokensave_ok = _setup_tokensave_mcp(registrar, verbose=verbose, force=force)
+        _disable_serena_mcp(registrar, verbose=verbose, reason="--code-memory none")
+        return
 
-    if serena or (not tokensave_ok and not no_serena):
+    if selection == _CODE_MEMORY_SERENA:
+        _disable_tokensave_mcp(registrar, verbose=verbose)
+        _setup_serena_mcp(registrar, context=serena_context, verbose=verbose, force=force)
+        return
+
+    # tokensave (default): primary compressor, Serena as automatic backup.
+    tokensave_ok = _setup_tokensave_mcp(registrar, verbose=verbose, force=force)
+    if not tokensave_ok and not suppress_serena_fallback:
         _setup_serena_mcp(registrar, context=serena_context, verbose=verbose, force=force)
     else:
-        # tokensave is primary (or Serena was explicitly disabled): drop any
-        # Serena entry a prior wrap installed; user-managed entries are kept.
         reason = (
-            "--no-serena" if no_serena else "tokensave is now the primary code-graph compressor"
+            "--no-serena"
+            if suppress_serena_fallback
+            else "tokensave is the primary code-graph compressor"
         )
         _disable_serena_mcp(registrar, verbose=verbose, reason=reason)
 
@@ -4473,18 +4539,25 @@ def wrap_selfheal(marker: str | None) -> None:
     is_flag=True,
     help="Skip headroom MCP server registration (compression markers will be unactionable)",
 )
+@_code_memory_option
 @click.option(
     "--no-tokensave",
     is_flag=True,
-    help="Skip the tokensave code-graph MCP server (primary coding-task compressor)",
+    hidden=True,
+    help="Deprecated: use --code-memory none/serena. Skip the tokensave code-graph MCP.",
 )
 @click.option(
     "--serena",
     is_flag=True,
-    help="Force the Serena MCP backup compressor on (registered automatically when "
-    "tokensave is unavailable)",
+    hidden=True,
+    help="Deprecated: use --code-memory serena. Force the Serena MCP compressor on.",
 )
-@click.option("--no-serena", is_flag=True, help="Never register the Serena backup compressor")
+@click.option(
+    "--no-serena",
+    is_flag=True,
+    hidden=True,
+    help="Deprecated: use --code-memory tokensave/none. Never register Serena.",
+)
 @click.option(
     "--code-graph",
     is_flag=True,
@@ -5533,18 +5606,25 @@ def _run_codex_wrap(
     is_flag=True,
     help="Skip headroom MCP server registration (compression markers will be unactionable)",
 )
+@_code_memory_option
 @click.option(
     "--no-tokensave",
     is_flag=True,
-    help="Skip the tokensave code-graph MCP server (primary coding-task compressor)",
+    hidden=True,
+    help="Deprecated: use --code-memory none/serena. Skip the tokensave code-graph MCP.",
 )
 @click.option(
     "--serena",
     is_flag=True,
-    help="Force the Serena MCP backup compressor on (registered automatically when "
-    "tokensave is unavailable)",
+    hidden=True,
+    help="Deprecated: use --code-memory serena. Force the Serena MCP compressor on.",
 )
-@click.option("--no-serena", is_flag=True, help="Never register the Serena backup compressor")
+@click.option(
+    "--no-serena",
+    is_flag=True,
+    hidden=True,
+    help="Deprecated: use --code-memory tokensave/none. Never register Serena.",
+)
 @click.option(
     "--code-graph",
     is_flag=True,
@@ -6024,18 +6104,25 @@ def kimi(
     help="Skip CLI context-tool setup",
 )
 @click.option("--no-mcp", is_flag=True, help="Skip headroom MCP server registration")
+@_code_memory_option
 @click.option(
     "--no-tokensave",
     is_flag=True,
-    help="Skip the tokensave code-graph MCP server (primary coding-task compressor)",
+    hidden=True,
+    help="Deprecated: use --code-memory none/serena. Skip the tokensave code-graph MCP.",
 )
 @click.option(
     "--serena",
     is_flag=True,
-    help="Force the Serena MCP backup compressor on (registered automatically when "
-    "tokensave is unavailable)",
+    hidden=True,
+    help="Deprecated: use --code-memory serena. Force the Serena MCP compressor on.",
 )
-@click.option("--no-serena", is_flag=True, help="Never register the Serena backup compressor")
+@click.option(
+    "--no-serena",
+    is_flag=True,
+    hidden=True,
+    help="Deprecated: use --code-memory tokensave/none. Never register Serena.",
+)
 @click.option(
     "--code-graph",
     is_flag=True,
