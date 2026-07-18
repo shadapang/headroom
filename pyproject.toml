@@ -329,9 +329,9 @@ headroom = "headroom.cli:main"
 [project.urls]
 Homepage = "https://headroom-docs.vercel.app"
 Documentation = "https://headroom-docs.vercel.app/docs"
-Repository = "https://github.com/chopratejas/headroom"
-Issues = "https://github.com/chopratejas/headroom/issues"
-Changelog = "https://github.com/chopratejas/headroom/blob/main/CHANGELOG.md"
+Repository = "https://github.com/headroomlabs-ai/headroom"
+Issues = "https://github.com/headroomlabs-ai/headroom/issues"
+Changelog = "https://github.com/headroomlabs-ai/headroom/blob/main/CHANGELOG.md"
 # llms.txt convention (llmstxt.org) — point AI agents / LLM crawlers
 # at the auto-generated docs index so they can resolve install paths
 # and entry points without a follow-up fetch.

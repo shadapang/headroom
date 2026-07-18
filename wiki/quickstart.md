@@ -38,7 +38,7 @@ npm install headroom-ai
 **Docker-native:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/chopratejas/headroom/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/headroomlabs-ai/headroom/main/scripts/install.sh | bash
 ```
 
 See [Docker-native install](docker-install.md) if you want Docker to provide the Headroom runtime while your agent CLIs stay on the host.

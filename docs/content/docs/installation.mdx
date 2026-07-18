@@ -61,7 +61,7 @@ args = ["mcp", "serve"]
 ```
 
 Native Intel macOS installs are currently tracked in
-[chopratejas/headroom#525](https://github.com/chopratejas/headroom/issues/525).
+[headroomlabs-ai/headroom#525](https://github.com/headroomlabs-ai/headroom/issues/525).
 Use [Docker-Native Install](/docs/docker-install) on Intel Macs until native
 wheel support lands.
 
@@ -140,7 +140,7 @@ To install the prerequisites:
 
 If you'd rather avoid the native toolchain entirely, run Headroom
 through Docker — see the [Docker](#docker) section below. Native
-Windows wheels are tracked in [#636](https://github.com/chopratejas/headroom/issues/636).
+Windows wheels are tracked in [#636](https://github.com/headroomlabs-ai/headroom/issues/636).
 
 ### pipx
 
@@ -218,8 +218,8 @@ node -e "const h = require('headroom-ai'); console.log('headroom-ai loaded')"
 Pre-built images are published to GitHub Container Registry on every release.
 
 ```bash
-docker pull ghcr.io/chopratejas/headroom:latest
-docker run -p 8787:8787 ghcr.io/chopratejas/headroom:latest
+docker pull ghcr.io/headroomlabs-ai/headroom:latest
+docker run -p 8787:8787 ghcr.io/headroomlabs-ai/headroom:latest
 ```
 
 <Callout type="info" title="Running Headroom without installing Python or Node?">

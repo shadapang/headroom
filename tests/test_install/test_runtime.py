@@ -79,7 +79,7 @@ def test_build_runtime_command_for_docker_includes_gpu_passthrough(
         port=8787,
         host="127.0.0.1",
         backend="anthropic",
-        image="ghcr.io/chopratejas/headroom:latest",
+        image="ghcr.io/headroomlabs-ai/headroom:latest",
         base_env={"HEADROOM_PORT": "8787", "HEADROOM_DOCKER_GPUS": "all"},
         proxy_args=["--host", "127.0.0.1", "--port", "8787"],
     )
@@ -115,7 +115,7 @@ def test_build_runtime_command_docker_manifest_env_beats_host_passthrough(
         port=8787,
         host="127.0.0.1",
         backend="anthropic",
-        image="ghcr.io/chopratejas/headroom:latest",
+        image="ghcr.io/headroomlabs-ai/headroom:latest",
         base_env={"HEADROOM_PORT": "8787", "HEADROOM_BACKEND": "anthropic"},
         proxy_args=["--host", "127.0.0.1", "--port", "8787"],
     )

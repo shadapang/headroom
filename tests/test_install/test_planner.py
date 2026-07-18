@@ -204,7 +204,7 @@ def _base_manifest_kwargs(**overrides):
         "proxy_mode": "token",
         "memory_enabled": False,
         "telemetry_enabled": False,
-        "image": "ghcr.io/chopratejas/headroom:latest",
+        "image": "ghcr.io/headroomlabs-ai/headroom:latest",
     }
     kwargs.update(overrides)
     return kwargs

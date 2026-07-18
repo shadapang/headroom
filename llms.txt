@@ -11,7 +11,7 @@ The canonical, always-current documentation index lives at the docs site below. 
 - [Live llms.txt (full doc index)](https://headroom-docs.vercel.app/llms.txt): Auto-generated index of every doc page with descriptions.
 - [Live llms-full.txt (every doc page concatenated)](https://headroom-docs.vercel.app/llms-full.txt): One Markdown blob containing every doc page. Use when you can spend the tokens for full context.
 - [Docs site](https://headroom-docs.vercel.app/docs): Human-browsable docs with search.
-- [GitHub repo](https://github.com/chopratejas/headroom): Source, issues, releases.
+- [GitHub repo](https://github.com/headroomlabs-ai/headroom): Source, issues, releases.
 - [PyPI package](https://pypi.org/project/headroom-ai/): Python install.
 - [npm package](https://www.npmjs.com/package/headroom-ai): TypeScript install.
 
@@ -19,7 +19,7 @@ The canonical, always-current documentation index lives at the docs site below. 
 
 - Python: `pip install headroom-ai` (add `[all]` for every optional extra)
 - TypeScript / Node: `npm install headroom-ai` (or `pnpm add headroom-ai`, `bun add headroom-ai`)
-- Docker: `docker run -p 8787:8787 ghcr.io/chopratejas/headroom:latest`
+- Docker: `docker run -p 8787:8787 ghcr.io/headroomlabs-ai/headroom:latest`
 - Run the proxy: `headroom proxy --port 8787` then point any client at `http://127.0.0.1:8787`
 - Wrap an agent in one command: `headroom wrap claude` (also: `codex`, `copilot`, `cursor`, `aider`, `opencode`, `cline`, `continue`, `goose`, `openhands`, `openclaw`, `vibe`, `omp`)
 

@@ -1,7 +1,7 @@
 # Headroom Realignment — Index
 
 **Status:** Drafted 2026-05-01 from a 10-agent deep audit against `~/Downloads/llm-proxy-compression-guide.md`.
-**Owner:** chopratejas
+**Owner:** headroomlabs-ai
 **Goal:** Move the entire codebase to Rust, preserve prefix cache, retain compression value, integrate RTK end-to-end, and gate compression policy by auth mode (PAYG / OAuth / subscription).
 
 ## Read in this order
