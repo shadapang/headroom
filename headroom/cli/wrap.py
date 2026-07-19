@@ -679,6 +679,49 @@ _rtk_option = click.option(
 )
 
 
+def _serena_instructions_opt_in() -> bool:
+    """Whether Serena instruction injection into the agent's hint file is enabled.
+
+    Injecting "prefer Serena symbol tools" guidance rewrites the user's
+    ``CLAUDE.md``/``AGENTS.md``, so it is opt-in (off by default): turn it on
+    with ``--serena-instructions`` (which sets ``HEADROOM_SERENA_INSTRUCTIONS=1``)
+    or by exporting ``HEADROOM_SERENA_INSTRUCTIONS=1``. Serena's ``.serena/``-only
+    setup (language scoping, pre-indexing) stays on by default regardless.
+    """
+    return os.environ.get("HEADROOM_SERENA_INSTRUCTIONS", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _serena_instructions_flag_callback(ctx: Any, param: Any, value: bool) -> bool:
+    """Click eager callback: ``--serena-instructions`` sets
+    HEADROOM_SERENA_INSTRUCTIONS so the central gate
+    (:func:`_serena_instructions_opt_in`) sees the opt-in without threading a
+    param through every wrap subcommand."""
+    if value:
+        os.environ["HEADROOM_SERENA_INSTRUCTIONS"] = "1"
+    return value
+
+
+# Shared opt-in flag for Serena instruction injection, applied to the wrap
+# subcommands that set up Serena. ``expose_value=False`` so no subcommand
+# signature changes; it works purely through HEADROOM_SERENA_INSTRUCTIONS. Same
+# approach as _rtk_option above — set via the callback with NO ``envvar=`` so the
+# settings_store drift guard doesn't flag it.
+_serena_instructions_option = click.option(
+    "--serena-instructions",
+    is_flag=True,
+    default=False,
+    expose_value=False,
+    is_eager=True,
+    callback=_serena_instructions_flag_callback,
+    help="Inject 'prefer Serena symbol tools' guidance into the agent's hint file (opt-in; off by default).",
+)
+
+
 # --- Code-memory MCP selection ------------------------------------------------
 # The code-memory MCP is on by default (tokensave). Swap it with --code-memory
 # serena, or turn it off with --code-memory none. Selection flows through
@@ -1643,10 +1686,15 @@ def _serena_instruction_file(registrar: Any) -> Path:
 def _inject_serena_instructions(file_path: Path, verbose: bool = False) -> bool:
     """Steer the agent toward Serena's symbol tools over whole-file reads.
 
+    Opt-in (off by default): mirrors :func:`_inject_rtk_instructions` and
+    early-returns unless ``--serena-instructions`` / ``HEADROOM_SERENA_INSTRUCTIONS``
+    is set, so the user's hint file is left untouched by default.
+
     Idempotent — skips if the marker is already present. Appends to an existing
-    instruction file, or creates one. Mirrors :func:`_inject_rtk_instructions`.
-    Returns True once the guidance is in place.
+    instruction file, or creates one. Returns True once the guidance is in place.
     """
+    if not _serena_instructions_opt_in():
+        return False
     if file_path.exists():
         existing = _read_text(file_path)
         if _SERENA_MARKER in existing:
@@ -4801,6 +4849,7 @@ def wrap_selfheal(marker: str | None) -> None:
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_rtk_option
+@_serena_instructions_option
 @click.option(
     # no "-p" short alias here: claude's own -p/--print must fall through to CLAUDE_ARGS
     "--port",
@@ -5878,6 +5927,7 @@ def _run_codex_wrap(
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_rtk_option
+@_serena_instructions_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )
@@ -6380,6 +6430,7 @@ def kimi(
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_rtk_option
+@_serena_instructions_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )
@@ -7571,6 +7622,7 @@ def openclaw(
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_rtk_option
+@_serena_instructions_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )

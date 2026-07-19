@@ -19,7 +19,20 @@ from headroom.cli import wrap as wrap_cli
 # ---------------------------------------------------------------------------
 
 
-def test_inject_creates_file_and_mentions_tools(tmp_path: Path) -> None:
+def _opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Enable the opt-in gate so injection actually writes.
+
+    Instruction injection rewrites the user's CLAUDE.md/AGENTS.md, so it is
+    off by default (mirrors RTK). Tests that exercise the write path must opt
+    in via ``HEADROOM_SERENA_INSTRUCTIONS``.
+    """
+    monkeypatch.setenv("HEADROOM_SERENA_INSTRUCTIONS", "1")
+
+
+def test_inject_creates_file_and_mentions_tools(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _opt_in(monkeypatch)
     target = tmp_path / "AGENTS.md"
     assert wrap_cli._inject_serena_instructions(target) is True
 
@@ -30,7 +43,8 @@ def test_inject_creates_file_and_mentions_tools(tmp_path: Path) -> None:
         assert tool in content, f"{tool} missing from injected guidance"
 
 
-def test_inject_is_idempotent(tmp_path: Path) -> None:
+def test_inject_is_idempotent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _opt_in(monkeypatch)
     target = tmp_path / "AGENTS.md"
     wrap_cli._inject_serena_instructions(target)
     wrap_cli._inject_serena_instructions(target)  # second call is a no-op
@@ -39,7 +53,8 @@ def test_inject_is_idempotent(tmp_path: Path) -> None:
     assert content.count(wrap_cli._SERENA_MARKER) == 1
 
 
-def test_inject_appends_to_existing_file(tmp_path: Path) -> None:
+def test_inject_appends_to_existing_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _opt_in(monkeypatch)
     target = tmp_path / "CLAUDE.md"
     target.write_text("# Project notes\n\nkeep me\n")
     wrap_cli._inject_serena_instructions(target)
@@ -47,6 +62,24 @@ def test_inject_appends_to_existing_file(tmp_path: Path) -> None:
     content = target.read_text()
     assert "keep me" in content  # existing content preserved
     assert wrap_cli._SERENA_MARKER in content
+
+
+def test_inject_off_by_default_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Without opting in, injection is a no-op: returns False and never touches
+    # the user's hint file (the default, so the two OpenCode AGENTS.md tests pass).
+    monkeypatch.delenv("HEADROOM_SERENA_INSTRUCTIONS", raising=False)
+
+    missing = tmp_path / "AGENTS.md"
+    assert wrap_cli._inject_serena_instructions(missing) is False
+    assert not missing.exists()  # nothing created
+
+    existing = tmp_path / "CLAUDE.md"
+    existing.write_text("# Project notes\n\nkeep me\n")
+    assert wrap_cli._inject_serena_instructions(existing) is False
+    assert existing.read_text() == "# Project notes\n\nkeep me\n"  # untouched
+    assert wrap_cli._SERENA_MARKER not in existing.read_text()
 
 
 def test_instruction_file_target_per_agent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
