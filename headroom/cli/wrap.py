@@ -697,7 +697,8 @@ def _resolve_code_memory(kwargs: dict[str, Any]) -> str:
 
     Precedence: the explicit selector (``--code-memory`` / ``HEADROOM_CODE_MEMORY``)
     wins; otherwise the deprecated ``--serena`` / ``--no-tokensave`` / ``--no-serena``
-    flags map into it; otherwise the default is ``tokensave``.
+    flags map into it; otherwise the default is ``serena`` — mature, offline,
+    symbol-level code navigation (tokensave is a lighter opt-in).
     """
     env = os.environ.get(_CODE_MEMORY_ENV, "").strip().lower()
     if env:
@@ -710,7 +711,9 @@ def _resolve_code_memory(kwargs: dict[str, Any]) -> str:
         return _CODE_MEMORY_SERENA
     if kwargs.get("no_tokensave"):
         return _CODE_MEMORY_NONE if kwargs.get("no_serena") else _CODE_MEMORY_SERENA
-    return _CODE_MEMORY_TOKENSAVE
+    if kwargs.get("no_serena"):
+        return _CODE_MEMORY_TOKENSAVE
+    return _CODE_MEMORY_SERENA
 
 
 def _code_memory_flag_callback(ctx: Any, param: Any, value: str | None) -> str | None:
@@ -733,7 +736,7 @@ _code_memory_option = click.option(
     is_eager=True,
     callback=_code_memory_flag_callback,
     help=(
-        "Code-memory MCP to register: 'tokensave' (default), 'serena', or 'none'. "
+        "Code-memory MCP to register: 'serena' (default), 'tokensave', or 'none'. "
         "Also set by HEADROOM_CODE_MEMORY. Replaces --serena/--no-serena/--no-tokensave."
     ),
 )
@@ -1492,6 +1495,44 @@ def _setup_headroom_mcp(
         click.echo(line)
 
 
+def _ensure_serena_dashboard_disabled(*, verbose: bool = False) -> None:
+    """Disable Serena's browser dashboard auto-open in ``~/.serena/serena_config.yml``.
+
+    Serena opens its web dashboard in a browser tab on launch by default
+    (``web_dashboard_open_on_launch: true``). Since Headroom now registers Serena
+    as the default code-memory MCP, flip that setting off so wrapped sessions
+    don't spawn a browser tab. The dashboard backend still runs and stays
+    reachable at http://localhost:24282/dashboard/. The setting lives in Serena's
+    own config (authoritative, unlike a startup flag); other keys and comments are
+    preserved via a targeted line edit rather than a YAML rewrite.
+    """
+    import re
+
+    cfg = Path.home() / ".serena" / "serena_config.yml"
+    key = "web_dashboard_open_on_launch"
+    try:
+        if cfg.exists():
+            text = cfg.read_text(encoding="utf-8")
+            pattern = re.compile(rf"^(\s*){re.escape(key)}:\s*\S+\s*$", re.MULTILINE)
+            if pattern.search(text):
+                new = pattern.sub(rf"\g<1>{key}: false", text)
+            else:
+                new = text.rstrip("\n") + f"\n{key}: false\n"
+            if new != text:
+                cfg.write_text(new, encoding="utf-8")
+                if verbose:
+                    click.echo("  Serena: disabled dashboard browser auto-open (serena_config.yml)")
+        else:
+            cfg.parent.mkdir(parents=True, exist_ok=True)
+            # Serena fills defaults for any keys we omit, so a single-key file is valid.
+            cfg.write_text(f"{key}: false\n", encoding="utf-8")
+            if verbose:
+                click.echo("  Serena: created serena_config.yml with dashboard auto-open off")
+    except OSError as e:
+        if verbose:
+            click.echo(f"  Serena: could not update serena_config.yml ({e})")
+
+
 def _setup_serena_mcp(
     registrar: Any, *, context: str, verbose: bool = False, force: bool = False
 ) -> None:
@@ -1519,6 +1560,9 @@ def _setup_serena_mcp(
     if shutil.which("uvx") is None:
         click.echo("  Serena MCP: uvx not found — install uv/uvx to enable Serena; skipping")
         return
+
+    # Serena is a real launch now — make sure it won't pop a browser tab.
+    _ensure_serena_dashboard_disabled(verbose=verbose)
 
     spec = build_serena_spec(context)
     result = registrar.register_server(spec, force=force)
@@ -1759,14 +1803,15 @@ def _disable_tokensave_mcp(registrar: Any, *, verbose: bool = False) -> None:
 
 
 def _setup_coding_compressor(registrar: Any, *, serena_context: str, **kwargs: Any) -> None:
-    """Set up the code-memory MCP, selected via ``--code-memory`` (default tokensave).
+    """Set up the code-memory MCP, selected via ``--code-memory`` (default serena).
 
     Selection (see :func:`_resolve_code_memory`):
 
-    * ``tokensave`` (default) — register tokensave; Serena is registered
+    * ``serena`` (default) — register Serena and remove any Headroom-installed
+      tokensave. Serena is mature, offline, and symbol-level.
+    * ``tokensave`` — register tokensave (lighter/faster); Serena is registered
       automatically only as a backup when tokensave is unavailable (unless the
       deprecated ``--no-serena`` suppressed the fallback).
-    * ``serena`` — register Serena and remove any Headroom-installed tokensave.
     * ``none`` — remove both Headroom-installed entries.
 
     Deprecated ``--serena`` / ``--no-serena`` / ``--no-tokensave`` flags map into
@@ -1788,7 +1833,7 @@ def _setup_coding_compressor(registrar: Any, *, serena_context: str, **kwargs: A
         _setup_serena_mcp(registrar, context=serena_context, verbose=verbose, force=force)
         return
 
-    # tokensave (default): primary compressor, Serena as automatic backup.
+    # tokensave (explicit opt-in): register it; Serena is the automatic backup.
     tokensave_ok = _setup_tokensave_mcp(registrar, verbose=verbose, force=force)
     if not tokensave_ok and not suppress_serena_fallback:
         _setup_serena_mcp(registrar, context=serena_context, verbose=verbose, force=force)

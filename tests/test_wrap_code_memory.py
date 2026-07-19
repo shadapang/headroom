@@ -21,9 +21,9 @@ def _clean_env() -> dict[str, str]:
     return env
 
 
-def test_default_is_tokensave() -> None:
+def test_default_is_serena() -> None:
     with patch.dict(os.environ, _clean_env(), clear=True):
-        assert wrap._resolve_code_memory({}) == wrap._CODE_MEMORY_TOKENSAVE
+        assert wrap._resolve_code_memory({}) == wrap._CODE_MEMORY_SERENA
 
 
 def test_selector_env_wins() -> None:
@@ -37,10 +37,33 @@ def test_deprecated_flags_map_into_selector() -> None:
     with patch.dict(os.environ, _clean_env(), clear=True):
         assert wrap._resolve_code_memory({"serena": True}) == wrap._CODE_MEMORY_SERENA
         assert wrap._resolve_code_memory({"no_tokensave": True}) == wrap._CODE_MEMORY_SERENA
+        # --no-serena means "not serena" → the other real graph, tokensave
+        assert wrap._resolve_code_memory({"no_serena": True}) == wrap._CODE_MEMORY_TOKENSAVE
         assert (
             wrap._resolve_code_memory({"no_tokensave": True, "no_serena": True})
             == wrap._CODE_MEMORY_NONE
         )
+
+
+def test_serena_dashboard_disabled_flips_existing_config(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = tmp_path / ".serena" / "serena_config.yml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(
+        "web_dashboard: true\nweb_dashboard_open_on_launch: true\ngui_log_window: false\n"
+    )
+    wrap._ensure_serena_dashboard_disabled()
+    text = cfg.read_text()
+    assert "web_dashboard_open_on_launch: false" in text
+    assert "web_dashboard: true" in text  # other keys preserved
+
+
+def test_serena_dashboard_disabled_creates_config(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    wrap._ensure_serena_dashboard_disabled()
+    cfg = tmp_path / ".serena" / "serena_config.yml"
+    assert cfg.exists()
+    assert "web_dashboard_open_on_launch: false" in cfg.read_text()
 
 
 def test_invalid_env_raises() -> None:
