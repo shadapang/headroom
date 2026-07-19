@@ -89,7 +89,15 @@ class RemoteKompressCompressor:
         target_ratio: float | None = None,
         *,
         allow_download: bool = True,
+        ccr_original: str | None = None,
     ) -> KompressResult:
+        # ccr_original: the text to store in CCR *instead of* ``content`` — mirrors
+        # KompressCompressor.compress. The ContentRouter passes it when custom tags are
+        # protected, in which case ``content`` here is the placeholdered intermediate
+        # ({{HEADROOM_TAG_N}}) and ccr_original is the real pre-protection text. We must store
+        # ccr_original (fallback ``content``) below, else a later /v1/retrieve returns the
+        # placeholder and the protected block is lost. Omitting the param entirely made every
+        # such call raise TypeError -> caught by the router -> content skipped (0% compression).
         n_words = len(content.split())
         if n_words < _MIN_WORDS:
             return self._passthrough(content, n_words)
@@ -126,7 +134,8 @@ class RemoteKompressCompressor:
         # store the mapping + append the retrieval marker here — same policy and
         # marker format as KompressCompressor.compress.
         if self.config.enable_ccr and result.compression_ratio < _CCR_RATIO_GATE:
-            cache_key = store_kompress_in_ccr(content, compressed, result.original_tokens)
+            ccr_source = ccr_original if ccr_original is not None else content
+            cache_key = store_kompress_in_ccr(ccr_source, compressed, result.original_tokens)
             if cache_key:
                 result.cache_key = cache_key
                 result.compressed += (
